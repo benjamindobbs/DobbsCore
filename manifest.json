@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "DobbsCore Gradebook Sync",
+  "version": "0.1.0",
+  "description": "Sync DobbsCore grades into PowerSchool assignments",
+
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://hartford.powerschool.com/*",
+    "http://localhost:*/*",
+    "https://classicalkenken-g0z3ra.fly.dev/*",
+    "https://classicaltech.org/*"
+  ],
+
+  "content_scripts": [{
+    "matches": ["https://hartford.powerschool.com/teachers/index.html*"],
+    "js": ["content.js"],
+    "run_at": "document_idle"
+  }],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "DobbsCore Settings"
+  }
+}
