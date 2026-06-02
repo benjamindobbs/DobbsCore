@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "Sync DobbsCore grades into PowerSchool assignments",
 
-  "permissions": ["storage"],
+  "permissions": ["storage", "tabs", "scripting"],
   "host_permissions": [
     "https://hartford.powerschool.com/*",
     "http://localhost:*/*",
@@ -12,11 +12,26 @@
     "https://classicaltech.org/*"
   ],
 
-  "content_scripts": [{
-    "matches": ["https://hartford.powerschool.com/teachers/index.html*"],
-    "js": ["content.js"],
-    "run_at": "document_idle"
-  }],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://hartford.powerschool.com/teachers/index.html*",
+        "https://hartford.powerschool.com/teachers/saveAttendanceGrid.action*",
+        "https://hartford.powerschool.com/teachers/attendance-grid.action*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://classicaltech.org/*",
+        "https://classicalkenken-g0z3ra.fly.dev/*",
+        "http://localhost:*/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
 
   "background": {
     "service_worker": "background.js"
