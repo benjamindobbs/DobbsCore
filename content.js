@@ -526,9 +526,16 @@ async function doMcSync(ctx, classId, mcId, type, subPoints, credPoints, mcInclu
     // PS assignment names are capped at 50 characters
     const psName = (s) => s.length <= 50 ? s : s.slice(0, 47) + '…';
 
+    if (progress.sync_enabled === 0) {
+        setStatus('This credential is excluded from gradebook sync. Enable it in the teacher portal to sync.', '#94a3b8');
+        return;
+    }
+
     if (type === 'formative') {
+        const enabledCps   = progress.checkpoints.filter(cp => cp.sync_enabled !== 0);
+        const skippedCount = progress.checkpoints.length - enabledCps.length;
         const syncedCheckpoints = [];
-        for (const cp of progress.checkpoints) {
+        for (const cp of enabledCps) {
             setStatus(`Syncing: ${cp.name}…`);
             const { assignmentId, assignmentsectionid } = await resolveAssignment(
                 progress.ps_ids.checkpoints[cp.id],
@@ -543,13 +550,17 @@ async function doMcSync(ctx, classId, mcId, type, subPoints, credPoints, mcInclu
                 ps_assignmentsection_id: String(assignmentsectionid)
             });
         }
-        await chrome.runtime.sendMessage({
-            type: 'KENKEN_FETCH', method: 'POST',
-            url:  `${serverUrl}/api/teacher/microcredentials/${mcId}/sync-ids`,
-            token: teacherToken,
-            body: { class_id: classId, checkpoints: syncedCheckpoints }
-        });
-        setStatus(`✓ Synced ${progress.checkpoints.length} checkpoint assignment${progress.checkpoints.length !== 1 ? 's' : ''}.`, '#16a34a');
+        if (syncedCheckpoints.length) {
+            await chrome.runtime.sendMessage({
+                type: 'KENKEN_FETCH', method: 'POST',
+                url:  `${serverUrl}/api/teacher/microcredentials/${mcId}/sync-ids`,
+                token: teacherToken,
+                body: { class_id: classId, checkpoints: syncedCheckpoints }
+            });
+        }
+        let msg = `✓ Synced ${enabledCps.length} checkpoint assignment${enabledCps.length !== 1 ? 's' : ''}.`;
+        if (skippedCount) msg += ` ${skippedCount} excluded from sync.`;
+        setStatus(msg, '#16a34a');
 
     } else {
         setStatus('Syncing credential assignment…');
