@@ -608,12 +608,16 @@ async function showRubricSyncPanel(ctx, classId) {
     const defaultName  = `Rubric ${new Date().toLocaleDateString('en-US', { month: 'numeric', day: 'numeric' })}`;
     const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
 
-    let defaultPoints = 75;
+    let defaultPoints = 100;
+    let perDayMax = 15;
     if (serverUrl && teacherToken) {
         const settingsResp = await chrome.runtime.sendMessage({
             type: 'KENKEN_FETCH', url: `${serverUrl}/api/teacher/gradebook-settings`, token: teacherToken
         });
-        if (settingsResp.ok) defaultPoints = settingsResp.data.rubric_max_score ?? 75;
+        if (settingsResp.ok) {
+            defaultPoints = settingsResp.data.assignment_max_score ?? 100;
+            perDayMax     = settingsResp.data.rubric_max_score     ?? 15;
+        }
     }
 
     const panel = makePanel('Sync Daily Rubric');
@@ -621,6 +625,7 @@ async function showRubricSyncPanel(ctx, classId) {
         ${field('Assignment Name', `<input id="ck-name"     type="text"   value="${defaultName}" ${IS}>`)}
         ${field('Due Date',        `<input id="ck-due"      type="date"   value="${today}" ${IS}>`)}
         ${field('Max Points',      `<input id="ck-points"   type="number" value="${defaultPoints}" min="1" ${IS}>`)}
+        <input id="ck-per-day-max" type="hidden" value="${perDayMax}">
         ${field('Category',        `<select id="ck-category" ${IS}><option value="">Loading…</option></select>`)}
         <div id="ck-period-row" style="display:none;margin-bottom:10px">
             <span style="font-size:11px;color:#64748b;font-weight:500;text-transform:uppercase;letter-spacing:.04em">Marking Period</span>
@@ -690,13 +695,18 @@ async function doRubricSync(ctx, classId) {
         const { assignmentId, assignmentsectionid } =
             await psCreateAssignment(name, duedate, dueDateObj, points, Number(ctx.sectionId), yearid, teachercategoryid);
 
+        const perDayMax  = parseFloat(document.getElementById('ck-per-day-max')?.value) || 15;
+        const totalDays  = totalsData.total_days || 1;
+        const maxPossible = totalDays * perDayMax;
+
         setStatus('Submitting scores…');
         const scores    = [];
         const unmatched = [];
         for (const s of totalsData.students) {
             const dcid = dcidMap[s.student_id];
             if (!dcid) { unmatched.push(s.student_id); continue; }
-            scores.push(psScoreEntry(dcid, s.total_score, assignmentsectionid, assignmentId, ctx.sectionId));
+            const scaledScore = Math.round((s.total_score / maxPossible) * points * 100) / 100;
+            scores.push(psScoreEntry(dcid, scaledScore, assignmentsectionid, assignmentId, ctx.sectionId));
         }
         if (scores.length) await psSubmitScores(scores);
 
