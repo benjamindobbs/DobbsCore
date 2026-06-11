@@ -486,19 +486,23 @@ async function doMcSync(ctx, classId, mcId, type, subPoints, credPoints, mcInclu
     const dcidMap = {};
     for (const s of await rosterResp.json()) dcidMap[s.studentnumber] = s.dcid;
 
-    // Helper: get or create a PS assignment, returning { assignmentId, assignmentsectionid }
+    // Helper: get or create a PS assignment, returning { assignmentId, assignmentsectionid }.
+    // Always verifies stored IDs against PS — the assignment may have been deleted since last sync.
     const resolveAssignment = async (existingIds, name, maxPts) => {
         if (existingIds?.ps_assignment_id) {
-            let { ps_assignment_id: assignmentId, ps_assignmentsection_id: assignmentsectionid } = existingIds;
-            if (!assignmentsectionid) {
-                const r = await fetch(`/ws/xte/section/assignment/${assignmentId}`);
-                if (r.ok) {
-                    const d = await r.json();
-                    assignmentsectionid = d._assignmentsections
-                        ?.find(s => String(s.sectionsdcid) === String(ctx.sectionId))?.assignmentsectionid;
+            const r = await fetch(`/ws/xte/section/assignment/${existingIds.ps_assignment_id}`);
+            if (r.ok) {
+                const d = await r.json();
+                const sec = d._assignmentsections
+                    ?.find(s => String(s.sectionsdcid) === String(ctx.sectionId));
+                const assignmentsectionid = Array.isArray(sec?.assignmentsectionid)
+                    ? sec.assignmentsectionid[0]
+                    : sec?.assignmentsectionid;
+                if (assignmentsectionid) {
+                    return { assignmentId: existingIds.ps_assignment_id, assignmentsectionid };
                 }
             }
-            return { assignmentId, assignmentsectionid };
+            // Assignment deleted or no longer linked to this section — create a new one
         }
         return psCreateAssignment(name, duedate, dueDateObj, maxPts, Number(ctx.sectionId), yearid, teachercategoryid);
     };
@@ -516,9 +520,12 @@ async function doMcSync(ctx, classId, mcId, type, subPoints, credPoints, mcInclu
         return unmatched;
     };
 
-    // Proportional score: subtasks done / total subtasks * maxPts (rounds to 2 dp)
+    // Proportional score: subtasks done / total subtasks * maxPts (rounds to 2 dp).
+    // If the checkpoint itself is marked complete (teacher override), give full credit
+    // regardless of whether individual subtasks were toggled.
     const subtaskScore = (s, cp, maxPts) => {
         if (!cp.subtasks?.length) return s.completions[cp.id] ? maxPts : 0;
+        if (s.completions[cp.id]) return maxPts;
         const done = cp.subtasks.filter(st => !!s.subtask_completions?.[st.id]).length;
         return Math.round((done / cp.subtasks.length) * maxPts * 100) / 100;
     };
@@ -570,21 +577,30 @@ async function doMcSync(ctx, classId, mcId, type, subPoints, credPoints, mcInclu
             credPoints
         );
 
+        // Only score against sync-enabled checkpoints — unsynced ones don't affect the grade.
+        const syncedCps = progress.checkpoints.filter(cp => cp.sync_enabled !== 0);
+
         const credScoreFn = mcIncludeSubtasks
             ? (s) => {
-                // % of all subtasks across all checkpoints × max
-                const allSubtasks = progress.checkpoints.flatMap(cp => cp.subtasks ?? []);
+                // % of all subtasks across sync-enabled checkpoints × max.
+                // A subtask counts as done if individually toggled OR if its parent
+                // checkpoint is marked complete (teacher toggled at checkpoint level).
+                const allSubtasks = syncedCps.flatMap(cp => cp.subtasks ?? []);
                 if (!allSubtasks.length) {
-                    const done = progress.checkpoints.filter(cp => !!s.completions[cp.id]).length;
-                    return Math.round((done / progress.checkpoints.length) * credPoints * 100) / 100;
+                    const done = syncedCps.filter(cp => !!s.completions[cp.id]).length;
+                    return Math.round((done / syncedCps.length) * credPoints * 100) / 100;
                 }
-                const done = allSubtasks.filter(st => !!s.subtask_completions?.[st.id]).length;
+                const done = allSubtasks.filter(st => {
+                    if (s.subtask_completions?.[st.id]) return true;
+                    const cp = syncedCps.find(cp => cp.subtasks?.some(sub => sub.id === st.id));
+                    return cp && !!s.completions[cp.id];
+                }).length;
                 return Math.round((done / allSubtasks.length) * credPoints * 100) / 100;
             }
             : (s) => {
-                // fully completed checkpoints ÷ total × max
-                const done = progress.checkpoints.filter(cp => !!s.completions[cp.id]).length;
-                return Math.round((done / progress.checkpoints.length) * credPoints * 100) / 100;
+                // fully completed synced checkpoints ÷ total synced × max
+                const done = syncedCps.filter(cp => !!s.completions[cp.id]).length;
+                return Math.round((done / syncedCps.length) * credPoints * 100) / 100;
             };
 
         const unmatched = await submitForAssignment(assignmentId, assignmentsectionid, credScoreFn);
@@ -982,7 +998,9 @@ async function doPullAttendance() {
         let cache       = allCached[cacheKey];
 
         if (!cache) {
-            // Filter to sections that actually contain the requested date in their range
+            // Fall back to scanning all cached sections for one that contains the requested date.
+            // PS uses different sectionId values in gradebook vs attendance URLs so the exact key
+            // often won't match — always verify by student DCID overlap before committing.
             const candidates = Object.entries(allCached)
                 .filter(([k, v]) => k.startsWith('att_') && (v.dates?.[0] ?? []).includes(mdDate));
 
@@ -991,25 +1009,23 @@ async function doPullAttendance() {
                 return;
             }
 
-            if (candidates.length === 1) {
-                cache = candidates[0][1];
-            } else {
-                // Multiple sections have this date — match by stored ps_dcid values
-                setPS('Matching attendance to class...');
-                const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
-                const classResp2 = await chrome.runtime.sendMessage({
-                    type: 'KENKEN_FETCH',
-                    url: `${serverUrl}/api/teacher/classes/${classId}`,
-                    token: teacherToken
-                });
-                if (classResp2.ok) {
-                    const knownDcids = new Set(classResp2.data.students.map(s => String(s.ps_dcid)).filter(Boolean));
-                    const match = candidates.find(([, v]) =>
-                        (v.studentIds?.[0] ?? []).some(id => knownDcids.has(String(id)))
-                    );
-                    if (match) cache = match[1];
-                }
-                if (!cache) cache = candidates[0][1]; // last resort
+            setPS('Matching attendance to class...');
+            const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
+            const classResp2 = await chrome.runtime.sendMessage({
+                type: 'KENKEN_FETCH',
+                url: `${serverUrl}/api/teacher/classes/${classId}`,
+                token: teacherToken
+            });
+            if (classResp2.ok) {
+                const knownDcids = new Set(classResp2.data.students.map(s => String(s.ps_dcid)).filter(Boolean));
+                const match = candidates.find(([, v]) =>
+                    (v.studentIds?.[0] ?? []).some(id => knownDcids.has(String(id)))
+                );
+                if (match) cache = match[1];
+            }
+            if (!cache) {
+                setPS(`Could not match cached attendance to this class. Open the PS attendance page for this class, then try again.`, '#dc2626');
+                return;
             }
         }
 
