@@ -4,6 +4,7 @@ const BTN_ID        = 'ck-sync-btn';
 const IMPORT_BTN_ID = 'ck-import-btn';
 const MC_BTN_ID     = 'ck-mc-btn';
 const RUBRIC_BTN_ID = 'ck-rubric-btn';
+const WBL_BTN_ID    = 'ck-wbl-btn';
 const PANEL_ID      = 'ck-sync-panel';
 
 // ── URL parsing ───────────────────────────────────────────────────────────────
@@ -30,6 +31,7 @@ function removeUI() {
     document.getElementById(IMPORT_BTN_ID)?.remove();
     document.getElementById(MC_BTN_ID)?.remove();
     document.getElementById(RUBRIC_BTN_ID)?.remove();
+    document.getElementById(WBL_BTN_ID)?.remove();
     document.getElementById(PANEL_ID)?.remove();
 }
 
@@ -91,6 +93,17 @@ async function checkAndInjectClassBtn(ctx) {
     // Always add a rubric sync button (rubric is available for all registered classes)
     makeBtn(RUBRIC_BTN_ID, 'Sync Rubric', '120px', '#0891b2',
         () => showRubricSyncPanel(ctx, matchedClass.id));
+
+    // Work-Based Learning: only when this class is linked to a WBL program
+    const wblResp = await chrome.runtime.sendMessage({
+        type: 'KENKEN_FETCH',
+        url: `${serverUrl}/api/wbl/sync/progress?class_id=${matchedClass.id}`,
+        token: teacherToken
+    });
+    if (wblResp.ok && wblResp.data?.programs?.length) {
+        makeBtn(WBL_BTN_ID, 'Sync Work-Based Learning', '168px', '#c2410c',
+            () => showWblSyncPanel(ctx, matchedClass.id, wblResp.data.programs.map(p => p.program)));
+    }
 }
 
 function makePanel(title) {
@@ -615,6 +628,325 @@ async function doMcSync(ctx, classId, mcId, type, subPoints, credPoints, mcInclu
         if (unmatched.length) msg += ` ${unmatched.length} unmatched.`;
         setStatus(msg, '#16a34a');
     }
+}
+
+// ── Work-Based Learning sync panel ────────────────────────────────────────────
+//
+// Three grains, mirroring the three scored lenses of the WBL framework:
+//   · Credentials  — one PS assignment per credential, partial credit by skills satisfied
+//   · Work Events  — one PS assignment per completed job, scored from its Holistic Call
+//   · Transfer     — one PS assignment per transfer skill, accumulating verified claims
+//
+// QC spot checks and the dispositional Do Now / Exit Slip are deliberately never
+// synced: they are formative and carry no score by design.
+
+// Clones the category list into the summative selector and preselects a
+// summative-looking category. loadCategories() only populates #ck-category,
+// and the WBL panel needs two: formative for skills, summative for credentials.
+function mirrorSummativeCategories() {
+    const src = document.getElementById('ck-category');
+    const dst = document.getElementById('ck-category-summ');
+    if (!src || !dst) return;
+    dst.innerHTML = src.innerHTML;
+    const summ = Array.from(dst.options).find(o => o.textContent.toLowerCase().includes('summative'));
+    if (summ) summ.selected = true;
+}
+
+function showWblSyncPanel(ctx, classId, programs) {
+    const today = new Date().toISOString().slice(0, 10);
+    const panel = makePanel('Sync Work-Based Learning');
+    panel.innerHTML += `
+        ${field('Program', `<select id="ck-wbl-prog" ${IS}>${programs.map(p =>
+            `<option value="${p.id}">${p.name}</option>`).join('')}</select>`)}
+        ${field('Formative Category', `<select id="ck-category" ${IS}><option value="">Loading…</option></select>`)}
+        ${field('Summative Category', `<select id="ck-category-summ" ${IS}><option value="">Loading…</option></select>`)}
+        <div id="ck-period-row" style="display:none;margin-bottom:10px">
+            <span style="font-size:11px;color:#64748b;font-weight:500;text-transform:uppercase;letter-spacing:.04em">Marking Period</span>
+            <span id="ck-period" style="display:block;font-size:13px;margin-top:3px"></span>
+        </div>
+        ${field('Due Date',              `<input id="ck-due"        type="date"   value="${today}" ${IS}>`)}
+        ${field('Work Event Max Points', `<input id="ck-we-points"   type="number" value="20" min="0.01" step="0.01" ${IS}>`)}
+        ${field('Transfer Max Points',   `<input id="ck-tr-points"   type="number" value="10" min="0.01" step="0.01" ${IS}>`)}
+        <p style="font-size:11px;color:#94a3b8;margin:-2px 0 10px;line-height:1.45">
+            Skills and credentials are completion grades, scored 0 or 100.
+        </p>
+        <div id="ck-wbl-jobs" style="margin-bottom:10px"></div>
+        <div id="ck-status" style="font-size:12px;color:#64748b;margin-bottom:12px;min-height:32px;line-height:1.4"></div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+            <button id="ck-wbl-skills" style="padding:9px;background:#2563eb;color:#fff;border:none;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer">Sync Skills (Formative)</button>
+            <button id="ck-wbl-cred" style="padding:9px;background:#0f172a;color:#fff;border:none;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer">Sync Credentials (Summative)</button>
+            <button id="ck-wbl-we"   style="padding:9px;background:#c2410c;color:#fff;border:none;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer">Sync Selected Work Events</button>
+            <button id="ck-wbl-tr"   style="padding:9px;background:#7c3aed;color:#fff;border:none;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer">Sync Transfer Skills</button>
+        </div>
+    `;
+    document.getElementById('ck-close').onclick = () => { removeUI(); injectButton(ctx); };
+    loadCategories(ctx.sectionId).then(() => mirrorSummativeCategories());
+
+    // Point defaults come from the teacher's DobbsCore gradebook settings so the
+    // two systems agree without re-typing.
+    (async () => {
+        const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
+        const gs = await chrome.runtime.sendMessage({
+            type: 'KENKEN_FETCH', url: `${serverUrl}/api/teacher/gradebook-settings`, token: teacherToken
+        });
+        if (!gs.ok) return;
+        const set = (id, v) => { const el = document.getElementById(id); if (el && v != null) el.value = v; };
+        set('ck-we-points',   gs.data.wbl_holistic_max_score);
+        set('ck-tr-points',   gs.data.wbl_transfer_max_score);
+    })();
+
+    let cache = null;   // last /sync/progress payload
+
+    const refreshJobs = async () => {
+        const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
+        const resp = await chrome.runtime.sendMessage({
+            type: 'KENKEN_FETCH',
+            url: `${serverUrl}/api/wbl/sync/progress?class_id=${classId}`,
+            token: teacherToken
+        });
+        if (!resp.ok) { setStatus('Could not load WBL progress.', '#dc2626'); return; }
+        cache = resp.data;
+        const progId = Number(document.getElementById('ck-wbl-prog').value);
+        const block  = cache.programs.find(p => p.program.id === progId);
+        const jobs   = block?.work_events ?? [];
+        const el = document.getElementById('ck-wbl-jobs');
+        el.innerHTML = jobs.length
+            ? `<span style="font-size:11px;color:#64748b;font-weight:500;text-transform:uppercase;letter-spacing:.04em">Completed Work Events</span>
+               <div style="max-height:132px;overflow-y:auto;border:1px solid #e2e8f0;border-radius:4px;padding:6px;margin-top:3px">
+                 ${jobs.map(j => `
+                   <label style="display:flex;align-items:center;gap:6px;padding:2px 0;font-size:12px;cursor:pointer">
+                     <input type="checkbox" class="ck-wbl-job" value="${j.work_event_id}" ${j.ps_assignment_id ? '' : 'checked'}>
+                     <span>${j.title}</span>
+                     ${j.ps_assignment_id ? '<span style="color:#94a3b8;font-size:11px">· synced</span>' : ''}
+                   </label>`).join('')}
+               </div>`
+            : '<span style="font-size:12px;color:#94a3b8">No completed work events yet.</span>';
+    };
+    document.getElementById('ck-wbl-prog').onchange = refreshJobs;
+    refreshJobs();
+
+    const readForm = () => {
+        const catSel = document.getElementById('ck-category');
+        const summSel = document.getElementById('ck-category-summ');
+        const f = {
+            duedate:   document.getElementById('ck-due')?.value,
+            wePts:     parseFloat(document.getElementById('ck-we-points')?.value),
+            trPts:     parseFloat(document.getElementById('ck-tr-points')?.value),
+            progId:    Number(document.getElementById('ck-wbl-prog')?.value),
+            teachercategoryid:     Number(catSel?.value),
+            summcategoryid:        Number(summSel?.value) || Number(catSel?.value),
+            termid:    Number(catSel?.dataset.termid),
+            storecode: catSel?.dataset.storecode,
+        };
+        if (!f.duedate)            { setStatus('Select a due date.', '#dc2626'); return null; }
+        if (!f.teachercategoryid)  { setStatus('Select a category.', '#dc2626'); return null; }
+        if (!f.termid)             { setStatus('Category data not loaded yet.', '#dc2626'); return null; }
+        if (!f.storecode)          { setStatus('No active marking period found.', '#dc2626'); return null; }
+        return f;
+    };
+
+    const run = async (kind) => {
+        const f = readForm();
+        if (!f) return;
+        const btns = ['ck-wbl-skills', 'ck-wbl-cred', 'ck-wbl-we', 'ck-wbl-tr'].map(id => document.getElementById(id));
+        btns.forEach(b => { b.disabled = true; b.style.opacity = '0.6'; });
+        try {
+            await doWblSync(ctx, classId, kind, f, cache);
+            await refreshJobs();
+        } catch (err) {
+            setStatus('Error: ' + err.message, '#dc2626');
+            console.error('[DobbsCore WBL sync]', err);
+        } finally {
+            btns.forEach(b => { b.disabled = false; b.style.opacity = ''; });
+        }
+    };
+    document.getElementById('ck-wbl-skills').onclick = () => run('skills');
+    document.getElementById('ck-wbl-cred').onclick = () => run('credentials');
+    document.getElementById('ck-wbl-we').onclick   = () => run('work_events');
+    document.getElementById('ck-wbl-tr').onclick   = () => run('transfer');
+}
+
+async function doWblSync(ctx, classId, kind, f, cache) {
+    const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
+    const yearid     = Math.floor(f.termid / 100);
+    const dueDateObj = new Date(f.duedate + 'T12:00:00').toISOString();
+
+    setStatus('Fetching WBL progress…');
+    const resp = await chrome.runtime.sendMessage({
+        type: 'KENKEN_FETCH',
+        url:  `${serverUrl}/api/wbl/sync/progress?class_id=${classId}`,
+        token: teacherToken
+    });
+    if (!resp.ok) throw new Error('Failed to fetch WBL progress.');
+    const data  = resp.data;
+    const block = data.programs.find(p => p.program.id === f.progId);
+    if (!block) throw new Error('Program is not linked to this class.');
+
+    setStatus('Fetching class roster…');
+    const rosterResp = await fetch(`/ws/xte/student?section_ids=${ctx.sectionId}&status=A,P`);
+    if (!rosterResp.ok) throw new Error(`Roster fetch failed (${rosterResp.status})`);
+    const dcidMap = {};
+    for (const s of await rosterResp.json()) dcidMap[s.studentnumber] = s.dcid;
+
+    // Verifies a stored PS assignment id before reusing it — the teacher may
+    // have deleted the assignment since the last sync.
+    const resolveAssignment = async (existing, name, maxPts, categoryid) => {
+        if (existing?.ps_assignment_id) {
+            const r = await fetch(`/ws/xte/section/assignment/${existing.ps_assignment_id}`);
+            if (r.ok) {
+                const d = await r.json();
+                const sec = d._assignmentsections?.find(s => String(s.sectionsdcid) === String(ctx.sectionId));
+                const asid = Array.isArray(sec?.assignmentsectionid) ? sec.assignmentsectionid[0] : sec?.assignmentsectionid;
+                if (asid) return { assignmentId: existing.ps_assignment_id, assignmentsectionid: asid };
+            }
+        }
+        return psCreateAssignment(name, f.duedate, dueDateObj, maxPts, Number(ctx.sectionId), yearid,
+                                  categoryid || f.teachercategoryid);
+    };
+
+    // Skills and credentials are completion grades, not partial mastery.
+    const COMPLETION = 100;
+
+    // scoreFn returns a number, or null to leave the student unscored.
+    const submitFor = async (assignmentId, assignmentsectionid, scoreFn) => {
+        const scores = [], unmatched = [];
+        for (const s of data.students) {
+            const dcid = dcidMap[s.student_id];
+            if (!dcid) { unmatched.push(s.student_name); continue; }
+            const v = scoreFn(s.student_id);
+            if (v == null) continue;
+            scores.push(psScoreEntry(dcid, v, assignmentsectionid, assignmentId, ctx.sectionId));
+        }
+        if (scores.length) await psSubmitScores(scores);
+        return { count: scores.length, unmatched };
+    };
+
+    const round2 = n => Math.round(n * 100) / 100;
+    const idsBack = { class_id: classId, skills: [], credentials: [], work_events: [], transfer: [] };
+    let summary = '';
+
+    // Formative: one 0/100 completion assignment per skill within a credential.
+    // Keyed on the pair because the same skill can be satisfied for one
+    // credential and not another with a stricter threshold.
+    if (kind === 'skills') {
+        const creds = block.credentials.filter(c => c.sync_enabled && c.skills.length);
+        if (!creds.length) throw new Error('No credential skills to sync.');
+        const total = creds.reduce((n, c) => n + c.skills.filter(sk => sk.sync_enabled).length, 0);
+        let done = 0, unmatched = [], satisfiedCount = 0;
+        for (const c of creds) {
+            for (const sk of c.skills.filter(x => x.sync_enabled)) {
+                setStatus(`Syncing “${sk.name}” (${++done}/${total})…`);
+                const { assignmentId, assignmentsectionid } = await resolveAssignment(
+                    sk, `${block.program.name}: ${c.name} — ${sk.name}`, COMPLETION, f.teachercategoryid);
+                const met = new Set(sk.satisfied);
+                const res = await submitFor(assignmentId, assignmentsectionid,
+                    sid => (met.has(sid) ? COMPLETION : 0));
+                unmatched = res.unmatched;
+                satisfiedCount += met.size;
+                idsBack.skills.push({
+                    credential_id: c.credential_id, skill_id: sk.skill_id,
+                    ps_assignment_id: String(assignmentId),
+                    ps_assignmentsection_id: String(assignmentsectionid),
+                });
+            }
+        }
+        summary = `✓ ${total} skill assignment(s). ${satisfiedCount} completion(s) recorded.`;
+        if (unmatched.length) summary += ` ${unmatched.length} unmatched.`;
+    }
+
+    // Summative: the credential itself, 0/100, earned or not. A credential
+    // rests on a complete evidence trail, so there is no partial credit.
+    if (kind === 'credentials') {
+        const creds = block.credentials.filter(c => c.sync_enabled);
+        if (!creds.length) throw new Error('No credentials to sync.');
+        let done = 0, unmatched = [];
+        for (const c of creds) {
+            setStatus(`Syncing “${c.name}” (${++done}/${creds.length})…`);
+            const { assignmentId, assignmentsectionid } = await resolveAssignment(
+                c, `${block.program.name}: ${c.name}`, COMPLETION, f.summcategoryid);
+            const prior = new Set(c.earned_prior);
+            const here  = new Set(c.earned);
+            const res = await submitFor(assignmentId, assignmentsectionid, sid => {
+                // Earned in another class or a previous year: its grade already
+                // landed there, so leave this term's assignment untouched.
+                if (prior.has(sid) && !here.has(sid)) return null;
+                return here.has(sid) ? COMPLETION : 0;
+            });
+            unmatched = res.unmatched;
+            idsBack.credentials.push({
+                credential_id: c.credential_id,
+                ps_assignment_id: String(assignmentId),
+                ps_assignmentsection_id: String(assignmentsectionid),
+            });
+        }
+        const earned = new Set(creds.flatMap(c => c.earned));
+        summary = `✓ ${creds.length} credential assignment(s). ${earned.size} earned.`;
+        if (unmatched.length) summary += ` ${unmatched.length} unmatched.`;
+    }
+
+    if (kind === 'work_events') {
+        const picked = new Set([...document.querySelectorAll('.ck-wbl-job:checked')].map(i => Number(i.value)));
+        const jobs = block.work_events.filter(w => w.sync_enabled && picked.has(w.work_event_id));
+        if (!jobs.length) throw new Error('Select at least one completed work event.');
+        let done = 0, unmatched = [];
+        for (const w of jobs) {
+            setStatus(`Syncing “${w.title}” (${++done}/${jobs.length})…`);
+            const { assignmentId, assignmentsectionid } =
+                await resolveAssignment(w, `${block.program.name}: ${w.title}`, f.wePts, f.summcategoryid);
+            const calls = Object.fromEntries(w.calls.map(c => [c.student_id, c]));
+            // Only participants with a Holistic Call are scored — a student who
+            // wasn't on the job gets no mark rather than a zero.
+            const res = await submitFor(assignmentId, assignmentsectionid, sid => {
+                const c = calls[sid];
+                if (!c) return null;
+                const pct = c.points_pct != null ? c.points_pct : (c.rank / 3) * 100;
+                return round2((pct / 100) * f.wePts);
+            });
+            unmatched = res.unmatched;
+            idsBack.work_events.push({
+                work_event_id: w.work_event_id,
+                ps_assignment_id: String(assignmentId),
+                ps_assignmentsection_id: String(assignmentsectionid),
+            });
+        }
+        summary = `✓ ${jobs.length} work event assignment(s) scored.`;
+        if (unmatched.length) summary += ` ${unmatched.length} unmatched.`;
+    }
+
+    if (kind === 'transfer') {
+        const LABEL = { application: 'Application of Previous Knowledge', extension: 'Extension of Knowledge' };
+        let done = 0, unmatched = [], scored = 0;
+        for (const t of block.transfer) {
+            if (t.sync_enabled === 0) continue;
+            setStatus(`Syncing ${LABEL[t.kind]} (${++done}/${block.transfer.length})…`);
+            const { assignmentId, assignmentsectionid } =
+                await resolveAssignment(t, `${block.program.name}: ${LABEL[t.kind]}`, f.trPts, f.summcategoryid);
+            const byStudent = Object.fromEntries(t.scores.map(s => [s.student_id, s]));
+            const res = await submitFor(assignmentId, assignmentsectionid, sid => {
+                const s = byStudent[sid];
+                if (!s) return null;              // no verified claim yet — leave blank
+                return round2(Math.min(s.score, f.trPts));
+            });
+            scored += res.count; unmatched = res.unmatched;
+            idsBack.transfer.push({
+                kind: t.kind,
+                ps_assignment_id: String(assignmentId),
+                ps_assignmentsection_id: String(assignmentsectionid),
+            });
+        }
+        summary = `✓ Transfer skills synced. ${scored} score(s) submitted.`;
+        if (unmatched.length) summary += ` ${unmatched.length} unmatched.`;
+    }
+
+    // Hand the PS assignment ids back so the next sync updates these
+    // assignments instead of creating duplicates.
+    await chrome.runtime.sendMessage({
+        type: 'KENKEN_FETCH', method: 'POST',
+        url:  `${serverUrl}/api/wbl/sync/ids`,
+        token: teacherToken,
+        body: idsBack,
+    });
+    setStatus(summary, '#16a34a');
 }
 
 // ── Daily rubric sync panel ───────────────────────────────────────────────────
