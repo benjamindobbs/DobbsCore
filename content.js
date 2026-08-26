@@ -1002,7 +1002,8 @@ async function doPullAttendance() {
             // PS uses different sectionId values in gradebook vs attendance URLs so the exact key
             // often won't match — always verify by student DCID overlap before committing.
             const candidates = Object.entries(allCached)
-                .filter(([k, v]) => k.startsWith('att_') && (v.dates?.[0] ?? []).includes(mdDate));
+                .filter(([k, v]) => k.startsWith('att_') && (v.dates?.[0] ?? []).includes(mdDate))
+                .sort((a, b) => (b[1].cachedAt ?? 0) - (a[1].cachedAt ?? 0));
 
             if (!candidates.length) {
                 setPS(`No cached attendance containing ${mdDate}. Open the PS attendance page for this class, then try again.`, '#dc2626');
