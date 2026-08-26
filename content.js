@@ -1210,7 +1210,7 @@ if (window.location.hostname.includes('powerschool.com')) {
 
 // ── DobbsCore portal injection ────────────────────────────────────────────────
 // Runs when the extension is loaded on the DobbsCore teacher portal.
-// Watches for the rubric tab and injects a "Pull from PS Attendance" button.
+// Watches for the WBL Roster tab and injects a "Sync Attendance from PS" button.
 
 if (window.location.hostname.includes('powerschool.com')) {
     // On the PS attendance page: auto-capture JS vars into chrome.storage.local
@@ -1219,14 +1219,14 @@ if (window.location.hostname.includes('powerschool.com')) {
         captureAttendanceFromPage();
     }
 } else {
-    // On DobbsCore portal: watch for rubric tab and inject pull button
-    const rubricObserver = new MutationObserver(() => {
-        const actionsEl = document.getElementById('rubric-tab-actions');
+    // On DobbsCore portal: watch for the WBL Roster tab and inject the sync button
+    const attObserver = new MutationObserver(() => {
+        const actionsEl = document.getElementById('wbl-attendance-sync');
         if (actionsEl && !document.getElementById('ck-pull-att-btn')) {
             injectPullAttendanceButton(actionsEl);
         }
     });
-    rubricObserver.observe(document.body, { childList: true, subtree: true });
+    attObserver.observe(document.body, { childList: true, subtree: true });
 }
 
 function showAttToast(msg, bg = '#16a34a') {
@@ -1276,7 +1276,7 @@ function captureAttendanceFromPage() {
 function injectPullAttendanceButton(actionsEl) {
     const btn = document.createElement('button');
     btn.id        = 'ck-pull-att-btn';
-    btn.textContent = '⟳ Pull from PS Attendance';
+    btn.textContent = '⟳ Sync Attendance from PS';
     Object.assign(btn.style, {
         padding: '0.5rem 1rem', background: '#0891b2', color: '#fff',
         border: 'none', borderRadius: '6px', fontSize: '0.875rem',
@@ -1294,6 +1294,24 @@ function injectPullAttendanceButton(actionsEl) {
     actionsEl.appendChild(statusSpan);
 }
 
+// PS's cached grid dates are bare "M/D" with no year. There's nothing in the
+// cache to disambiguate, so this infers the school year from today's date
+// (Jul–Jun year boundary, standard for US districts): a month on/after July
+// belongs to the year the current school year started, everything else to
+// the year it ends. Good enough for "sync shortly after visiting the PS
+// attendance page," which is the only way this cache gets populated anyway.
+function mdToIso(md) {
+    const [m, d] = md.split('/').map(Number);
+    const now = new Date();
+    const schoolYearStart = now.getMonth() >= 6 ? now.getFullYear() : now.getFullYear() - 1; // getMonth() is 0-based, 6 = July
+    const year = m >= 7 ? schoolYearStart : schoolYearStart + 1;
+    return `${year}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+}
+
+// Bulk direct ingest: the whole cached date range for every class linked to
+// the selected WBL program, posted straight to the server in one shot per
+// class — no per-date review step. Trusts PS as the source of truth; the
+// only manual override is the "Called Out" button on the roster itself.
 async function doPullAttendance() {
     const btn      = document.getElementById('ck-pull-att-btn');
     const statusEl = document.getElementById('ck-pull-att-status');
@@ -1301,124 +1319,102 @@ async function doPullAttendance() {
         if (statusEl) { statusEl.textContent = msg; statusEl.style.color = color; }
     };
 
-    const classId = document.getElementById('rubric-class-select')?.value;
-    const isoDate = document.getElementById('rubric-tab-date')?.value;
-    if (!classId) { setPS('Select a class first.', '#dc2626'); return; }
-    if (!isoDate) { setPS('Select a date first.', '#dc2626'); return; }
+    const programId = document.getElementById('wbl-program-select')?.value;
+    if (!programId) { setPS('Select a program first.', '#dc2626'); return; }
 
-    btn.disabled = true; btn.textContent = 'Pulling...'; setPS('');
+    btn.disabled = true; btn.textContent = 'Syncing...'; setPS('');
 
     try {
         if (!chrome?.storage?.local) {
             throw new Error('Extension storage not available — reload the page and try again.');
         }
 
-        const classSel = document.getElementById('rubric-class-select');
-        const psSectionId = classSel?.selectedOptions[0]?.dataset?.psSection;
-        if (!psSectionId) { setPS('Class has no linked PS section ID.', '#dc2626'); return; }
+        const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
 
-        const [yr, mm, dd] = isoDate.split('-');
-        const psDate = `${mm}/${dd}/${yr}`;
-        const mdDate = `${parseInt(mm)}/${parseInt(dd)}`;
+        const [wblClassesResp, allClassesResp] = await Promise.all([
+            chrome.runtime.sendMessage({ type: 'KENKEN_FETCH', url: `${serverUrl}/api/wbl/programs/${programId}/classes`, token: teacherToken }),
+            chrome.runtime.sendMessage({ type: 'KENKEN_FETCH', url: `${serverUrl}/api/teacher/classes`, token: teacherToken }),
+        ]);
+        if (!wblClassesResp.ok || !allClassesResp.ok) { setPS('Could not load linked classes from DobbsCore.', '#dc2626'); return; }
+        if (!wblClassesResp.data.length) { setPS('This program has no linked classes yet.', '#dc2626'); return; }
 
-        // Read from cache written when teacher visited the PS attendance page.
-        // Keyed by section only (no date) — the full grid is stored and any date can be looked up.
-        // PS uses different sectionId values in gradebook vs attendance URLs, so fall back to
-        // scanning all cached sections for one that contains the requested date.
-        const cacheKey  = `att_${psSectionId}`;
+        const sectionByClassId = {};
+        for (const c of allClassesResp.data) sectionByClassId[c.id] = c.ps_section_id;
+
         const allCached = await chrome.storage.local.get(null);
-        let cache       = allCached[cacheKey];
+        let totalImported = 0, totalUnmatched = 0, classesSynced = 0;
 
-        if (!cache) {
-            // Fall back to scanning all cached sections for one that contains the requested date.
-            // PS uses different sectionId values in gradebook vs attendance URLs so the exact key
-            // often won't match — always verify by student DCID overlap before committing.
-            const candidates = Object.entries(allCached)
-                .filter(([k, v]) => k.startsWith('att_') && (v.dates?.[0] ?? []).includes(mdDate))
-                .sort((a, b) => (b[1].cachedAt ?? 0) - (a[1].cachedAt ?? 0));
+        for (const cls of wblClassesResp.data) {
+            const psSectionId = sectionByClassId[cls.id];
+            if (!psSectionId) continue;   // no PS section linked to this class
 
-            if (!candidates.length) {
-                setPS(`No cached attendance containing ${mdDate}. Open the PS attendance page for this class, then try again.`, '#dc2626');
-                return;
-            }
+            setPS(`Matching ${cls.name}...`);
 
-            setPS('Matching attendance to class...');
-            const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
-            const classResp2 = await chrome.runtime.sendMessage({
-                type: 'KENKEN_FETCH',
-                url: `${serverUrl}/api/teacher/classes/${classId}`,
-                token: teacherToken
-            });
-            if (classResp2.ok) {
-                const knownDcids = new Set(classResp2.data.students.map(s => String(s.ps_dcid)).filter(Boolean));
-                const match = candidates.find(([, v]) =>
-                    (v.studentIds?.[0] ?? []).some(id => knownDcids.has(String(id)))
-                );
-                if (match) cache = match[1];
+            // Same section-id-mismatch fallback the old single-date pull used:
+            // PS uses different sectionId values in gradebook vs attendance
+            // URLs, so verify by student DCID overlap rather than trusting
+            // the cache key alone.
+            let cache = allCached[`att_${psSectionId}`];
+            if (!cache) {
+                const classResp = await chrome.runtime.sendMessage({
+                    type: 'KENKEN_FETCH', url: `${serverUrl}/api/teacher/classes/${cls.id}`, token: teacherToken
+                });
+                if (classResp.ok) {
+                    const knownDcids = new Set(classResp.data.students.map(s => String(s.ps_dcid)).filter(Boolean));
+                    const match = Object.entries(allCached)
+                        .filter(([k]) => k.startsWith('att_'))
+                        .sort((a, b) => (b[1].cachedAt ?? 0) - (a[1].cachedAt ?? 0))
+                        .find(([, v]) => (v.studentIds?.[0] ?? []).some(id => knownDcids.has(String(id))));
+                    if (match) cache = match[1];
+                }
             }
             if (!cache) {
-                setPS(`Could not match cached attendance to this class. Open the PS attendance page for this class, then try again.`, '#dc2626');
-                return;
+                setPS(`No cached attendance for ${cls.name} — open the PS attendance page for it first.`, '#dc2626');
+                continue;
             }
-        }
 
-        const studentDcids = cache.studentIds?.[0];
-        const dates        = cache.dates?.[0];
-        const attData      = cache.attData?.[0];
-        if (!studentDcids || !dates || !attData) {
-            setPS('Cached data is incomplete. Re-open the PS attendance page.', '#dc2626');
-            return;
-        }
+            const studentDcids = cache.studentIds?.[0];
+            const dates        = cache.dates?.[0];
+            const attData      = cache.attData?.[0];
+            if (!studentDcids || !dates || !attData) continue;
 
-        const dateIdx = dates.indexOf(mdDate);
-        if (dateIdx === -1) {
-            setPS(`Date ${mdDate} not found in cached attendance (not a school day?).`, '#dc2626');
-            return;
-        }
+            // dates (sec_att_date_arr) is already meeting-days-only — a date
+            // absent from it never appears here, so there's nothing to filter.
+            const rows = [];
+            studentDcids.forEach((dcid, sIdx) => {
+                dates.forEach((mdDate, dIdx) => {
+                    const code = attData[sIdx]?.[dIdx]?.[0]?.[3]?.[1] ?? '';
+                    rows.push({ ps_dcid: dcid, date: mdToIso(mdDate), code });
+                });
+            });
+            if (!rows.length) continue;
 
-        const codeByDcid = {};
-        studentDcids.forEach((dcid, sIdx) => {
-            codeByDcid[String(dcid)] = attData[sIdx]?.[dateIdx]?.[0]?.[3]?.[1] ?? '';
-        });
-
-        // Fetch DobbsCore students for this class — they have ps_dcid stored from import
-        setPS('Matching students...');
-        const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
-        const classResp = await chrome.runtime.sendMessage({
-            type: 'KENKEN_FETCH',
-            url: `${serverUrl}/api/teacher/classes/${classId}`,
-            token: teacherToken
-        });
-        if (!classResp.ok) { setPS('Could not load class roster from DobbsCore.', '#dc2626'); return; }
-
-        console.log('[DobbsCore Pull] codeByDcid keys (from PS cache):', Object.keys(codeByDcid));
-        console.log('[DobbsCore Pull] DobbsCore students:',
-            classResp.data.students.map(s => ({ name: s.student_name, student_id: s.student_id, ps_dcid: s.ps_dcid }))
-        );
-
-        let filled = 0;
-        for (const s of classResp.data.students) {
-            if (!s.ps_dcid) continue;
-            const code = codeByDcid[String(s.ps_dcid)];
-            if (code === undefined) continue;
-            const tlSel = document.getElementById(`rb-tl-${s.student_id}`);
-            if (!tlSel) continue;
-            tlSel.value = String(codeToTimeliness(code));
-            tlSel.dispatchEvent(new Event('change'));
-            filled++;
+            const importResp = await chrome.runtime.sendMessage({
+                type: 'KENKEN_FETCH', method: 'POST',
+                url: `${serverUrl}/api/wbl/classes/${cls.id}/attendance/import`,
+                token: teacherToken, body: { rows },
+            });
+            if (importResp.ok) {
+                totalImported += importResp.data.imported;
+                totalUnmatched += importResp.data.unmatched.length;
+                classesSynced++;
+            } else {
+                console.error('[Sync Attendance]', cls.name, importResp.error || importResp.status);
+            }
         }
 
         setPS(
-            filled > 0
-                ? `Filled ${filled} student${filled !== 1 ? 's' : ''} from PS.`
-                : 'No students matched - check roster is imported.',
-            filled > 0 ? '#16a34a' : '#dc2626'
+            classesSynced > 0
+                ? `Synced ${totalImported} record${totalImported !== 1 ? 's' : ''} across ${classesSynced} class${classesSynced !== 1 ? 'es' : ''}`
+                  + (totalUnmatched ? `, ${totalUnmatched} unmatched (no ps_dcid on record).` : '.')
+                : 'Nothing synced — open the PS attendance page for a linked class first.',
+            classesSynced > 0 ? '#16a34a' : '#dc2626'
         );
     } catch (err) {
         setPS(`Error: ${err.message}`, '#dc2626');
-        console.error('[Pull Attendance]', err);
+        console.error('[Sync Attendance]', err);
     } finally {
-        btn.disabled = false; btn.textContent = 'Pull from PS Attendance';
+        btn.disabled = false; btn.textContent = '⟳ Sync Attendance from PS';
     }
 }
 
@@ -1442,13 +1438,4 @@ function extractJsVar(html, varName) {
         i++;
     }
     try { return JSON.parse(html.slice(start, i)); } catch { return null; }
-}
-
-// Maps a PS attendance code to a rubric timeliness value (5/3/0).
-function codeToTimeliness(code) {
-    if (!code) return 5;
-    const c = code.toUpperCase();
-    if (c === 'UXT') return 3;  // Unexcused Tardy
-    if (c === 'UNV') return 0;  // Unverified Absence
-    return 5;                   // All other codes → On Time
 }
