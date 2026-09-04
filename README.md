@@ -8,7 +8,7 @@ A Chrome extension that bridges the [DobbsCore](https://classicaltech.org) teach
 
 The extension injects buttons into PowerSchool gradebook pages and the DobbsCore teacher portal. Because the PS gradebook is a browser app that authenticates via session cookies, the extension can make PS API calls directly from the browser on the teacher's behalf — no server-side PS access needed.
 
-DobbsCore API calls (fetching class rosters, grades, microcredential progress, and rubric totals) are proxied through the extension's background service worker to bypass CORS restrictions.
+DobbsCore API calls (fetching class rosters, activity grades, and Work-Based Learning sync progress) are proxied through the extension's background service worker to bypass CORS restrictions.
 
 PS API calls originating from the DobbsCore portal are routed through an open PS tab via `chrome.scripting.executeScript`, so session cookies are included automatically without any extra login.
 
@@ -22,17 +22,19 @@ PS API calls originating from the DobbsCore portal are routed through an open PS
 
 **Sync DobbsCore Grades** — appears on the PS score-entry page for an existing assignment. Scores the open assignment using DobbsCore activity grades for a selected date range without creating a new assignment.
 
-**Sync Microcredentials** — appears on a PS class page when the registered class has one or more microcredentials defined in DobbsCore. Offers two operations:
+**Sync Work-Based Learning** — appears on a PS class page once the section is registered and linked to a WBL program in DobbsCore. Syncs the three scored WBL lenses independently, each its own button:
 
-- *Sync Checkpoints* — creates or updates one PS assignment per checkpoint (formative). Each student's score is proportional to the number of subtasks completed. Assignments excluded from sync in the teacher portal are skipped.
-- *Sync Credential* — creates or updates a single summative PS assignment for the whole credential. Score is the percentage of all subtasks completed across all checkpoints (or percentage of fully-completed checkpoints if subtask tracking is disabled in gradebook settings). PS assignment IDs are saved back to DobbsCore so re-syncing updates the same assignments rather than creating new ones.
+- *Sync Skills (Formative)* — one 0/100 completion assignment per (credential, skill) pair: 100 if the student has satisfied that skill's required demonstrations toward that credential, 0 otherwise.
+- *Sync Credentials (Summative)* — one 0/100 assignment per credential: 100 if earned in this class this term, 0 otherwise. A credential earned in a prior class or year is left unscored here — its grade already landed where it was earned.
+- *Sync Selected Work Events* — one assignment per completed Work Event you check off, scored from its Holistic Call tier (blended with the student's attendance ratio for that job's window when attendance data has been pulled — see below).
+- *Sync Transfer Skills* — one assignment per transfer kind (Application of Previous Knowledge, Extension of Knowledge), scored from the sum of verified transfer-claim scores.
 
-**Sync Daily Rubric** — appears on a PS class page for all registered classes. Creates a new PS assignment scored from DobbsCore daily rubric totals for a selected date range. Each student's score is scaled as `(total_rubric_points / (days × per_day_max)) × assignment_max`.
+QC Spot Checks and the dispositional Do Now / Exit Slip lens are formative by design and never sync to PS. PS assignment IDs are saved back to DobbsCore after each sync so re-syncing updates the same assignments instead of creating duplicates.
 
-**PS Attendance → DobbsCore Rubric** — a two-step flow that pre-fills timeliness values in the DobbsCore rubric UI from PS attendance data:
+**Sync Attendance from PS** — lives in the DobbsCore teacher portal's WBL **Roster** tab, not on a PS page. Two-step flow that feeds the attendance blend used by *Sync Selected Work Events* above:
 
-1. When the teacher opens the PS attendance grid page, the extension automatically reads the attendance data embedded in the page and caches it in browser storage.
-2. On the DobbsCore portal rubric tab, a **Pull from PS Attendance** button appears. Clicking it looks up the cached attendance for the selected class and date, and sets each student's timeliness field: `UXT` (Unexcused Tardy) → 3, `UNV` (Unverified Absence) → 0, all other codes → 5 (On Time).
+1. Open the PS **Attendance Grid** page for a section. The extension automatically reads the grid's embedded attendance data and caches it in browser storage (a toast confirms how many students/dates were captured).
+2. Back in the DobbsCore portal's WBL Roster tab, click **Sync Attendance from PS**. It matches the selected program's linked classes to their cached PS sections (by student DCID overlap if the section IDs don't line up), and bulk-imports every cached date for each — no per-date review step. `UNV` (Unverified Absence) counts against a student's ratio unless a teacher has logged a "Called Out" override for that date on the WBL Roster; `UXT` (Unexcused Tardy) counts as half credit; everything else counts as present.
 
 ### Grade calculation
 
@@ -44,12 +46,13 @@ PS API calls originating from the DobbsCore portal are routed through an open PS
 
 Students who haven't linked their DobbsCore account receive the no-submission score. Students are matched between systems by their 6-digit PS Student Number.
 
-**Microcredential scores** are computed client-side by the extension:
+A student who enrolled partway through the selected date range has their required activity count prorated by the fraction of the window they were actually on the roster for (based on the PS section entry date captured by **Re-sync Roster** below), rather than being scored as if they'd been enrolled the whole time. A student whose enrollment doesn't overlap the window at all is left unscored rather than given a zero.
 
-- *Checkpoint (formative)*: `(subtasks_completed / total_subtasks) × max_points`, or full/zero points for checkpoints with no subtasks.
-- *Credential (summative)*: `(all_subtasks_completed / total_subtasks) × max_points` when subtask tracking is enabled; `(checkpoints_completed / total_checkpoints) × max_points` otherwise.
+**Work-Based Learning scores** are computed server-side by DobbsCore and are all completion or tier-based, never partial-credit fractions:
 
-**Rubric scores** are computed client-side: `(student_total / (days × per_day_max)) × assignment_max`, rounded to 2 decimal places.
+- *Skills* and *Credentials*: 100 if satisfied/earned, 0 otherwise (see Flows above).
+- *Work Events*: the Holistic Call tier's configured point percentage, blended 80/20 with the student's attendance ratio for that job's window when attendance has been pulled for the relevant PS section — otherwise the raw tier percentage.
+- *Transfer*: the sum of an instructor's verified transfer-claim scores, capped at the configured max.
 
 Default max-points values for all flows are pre-filled from the teacher's DobbsCore gradebook settings.
 
@@ -122,31 +125,23 @@ The extension will create the PS assignment, fetch DobbsCore grades, and submit 
 3. Select the DobbsCore class and date range.
 4. Click **Sync Grades**.
 
-### Syncing microcredential checkpoints and credentials
+### Syncing Work-Based Learning grades
 
-1. Navigate to a registered class page in PS.
-2. Click **Sync Microcredentials** (purple button, bottom-right). This button only appears if the class has microcredentials defined in DobbsCore.
-3. Select the microcredential, category, due date, and max points.
-4. Click **Sync Checkpoints** to create/update one PS assignment per checkpoint, or **Sync Credential** to create/update a single summative assignment for the full credential.
+1. Navigate to a registered class page in PS. This button only appears if the class is linked to a WBL program in DobbsCore.
+2. Click **Sync Work-Based Learning** (orange button, bottom-right).
+3. Choose the WBL program, formative and summative categories, due date, and Work Event / Transfer max points.
+4. For Work Events, check off which completed jobs to sync (unsynced ones default to checked; already-synced ones default unchecked so you don't accidentally re-push everyone).
+5. Click **Sync Skills (Formative)**, **Sync Credentials (Summative)**, **Sync Selected Work Events**, or **Sync Transfer Skills** — each runs independently, so you only need to click the ones you want to push this time.
 
 On subsequent syncs the extension updates the same PS assignments rather than creating new ones.
 
-### Syncing daily rubric grades
+### Pulling PS attendance for the Work-Based Learning attendance blend
 
-1. Navigate to a registered class page in PS.
-2. Click **Sync Rubric** (teal button, bottom-right).
-3. Fill in the assignment name, due date, max points, category, and the date range to include.
-4. Click **Create & Sync**.
-
-Scores are scaled to the assignment's max points based on each student's total rubric points relative to the maximum possible over the selected period.
-
-### Pulling PS attendance into the DobbsCore rubric
-
-1. In the PS gradebook, open the **Attendance Grid** page for the class you want to grade.
-   - The extension automatically reads and caches the attendance data in the background. A brief toast notification confirms success.
-2. In the DobbsCore teacher portal, navigate to the **Daily Rubric** tab, select the class and date.
-3. Click **Pull from PS Attendance** (appears in the rubric tab actions area).
-   - Timeliness fields are filled for each matched student: Unexcused Tardy → 3, Unverified Absence → 0, all other codes → 5.
+1. In the PS gradebook, open the **Attendance Grid** page for each section you want to pull.
+   - The extension automatically reads and caches that section's attendance data in the background. A brief toast notification confirms success.
+2. In the DobbsCore teacher portal, navigate to the WBL program's **Roster** tab.
+3. Click **Sync Attendance from PS**.
+   - The extension matches every class linked to that program against its cached PS attendance and bulk-imports the whole cached date range for each — there's no per-date step. Attendance only affects grades through the Work Event blend described above; it plays no part in activity-grade or WBL Skills/Credentials/Transfer scoring.
 
 ---
 
@@ -164,8 +159,8 @@ Scores are scaled to the assignment's max points based on each student's total r
 ## Notes
 
 - The extension relies on PS session cookies already present in the browser. The teacher must be logged into PowerSchool for any sync to work.
-- For the PS Attendance pull to work, the teacher must open the PS Attendance Grid page for the relevant class *before* using Pull from PS Attendance in the DobbsCore portal. The attendance data is cached per-section and is valid until the browser is restarted or the extension is reloaded.
-- If the same date appears in attendance caches for multiple sections, the extension matches the correct section using the PS student DCIDs stored at import time.
+- For Sync Attendance from PS to have anything to import, the teacher must open each section's PS Attendance Grid page *before* clicking Sync Attendance from PS in the DobbsCore portal. The attendance data is cached per-section and is valid until the browser is restarted or the extension is reloaded.
+- If a cached section doesn't match a class's stored `ps_section_id`, the extension falls back to matching by PS student DCID overlap (captured at roster import/re-sync time).
 - If the extension button doesn't appear after install, reload the extension at `chrome://extensions` and hard-refresh the PS tab (`Ctrl+Shift+R`).
 - Student matching is done by PS **Student Number** (the 6-digit district ID). DobbsCore student records must use this same ID.
-- Microcredential checkpoints marked as excluded from sync in the teacher portal are skipped during the Sync Checkpoints flow.
+- A skill required by two different credentials syncs as two separate PS assignments, one per credential — because each credential can set its own required-demonstrations threshold for the same skill, there's no single shared assignment for it.
