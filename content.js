@@ -2,6 +2,7 @@
 
 const BTN_ID        = 'ck-sync-btn';
 const IMPORT_BTN_ID = 'ck-import-btn';
+const RESYNC_BTN_ID = 'ck-resync-btn';
 const MC_BTN_ID     = 'ck-mc-btn';
 const RUBRIC_BTN_ID = 'ck-rubric-btn';
 const WBL_BTN_ID    = 'ck-wbl-btn';
@@ -29,6 +30,7 @@ function getPageContext() {
 function removeUI() {
     document.getElementById(BTN_ID)?.remove();
     document.getElementById(IMPORT_BTN_ID)?.remove();
+    document.getElementById(RESYNC_BTN_ID)?.remove();
     document.getElementById(MC_BTN_ID)?.remove();
     document.getElementById(RUBRIC_BTN_ID)?.remove();
     document.getElementById(WBL_BTN_ID)?.remove();
@@ -78,6 +80,10 @@ async function checkAndInjectClassBtn(ctx) {
     }
 
     makeBtn(BTN_ID, 'Create DobbsCore Assignment', '24px', '#2563eb', () => showCreatePanel(ctx));
+
+    // Re-pull the PS roster and reconcile adds/withdrawals against DobbsCore.
+    // Fixed 216px slot so it never collides with the conditional MC/WBL buttons.
+    makeBtn(RESYNC_BTN_ID, 'Re-sync Roster', '216px', '#d97706', () => showResyncPanel(ctx, matchedClass));
 
     // Check for microcredentials on this class and add a second button if any exist
     const mcResp = await chrome.runtime.sendMessage({
@@ -1193,6 +1199,85 @@ async function doImportRoster(ctx) {
     // Remove the import button — section is now registered
     document.getElementById(IMPORT_BTN_ID)?.remove();
     btn.disabled = false; btn.textContent = 'Import';
+}
+
+// ── Re-sync roster ────────────────────────────────────────────────────────────
+// Reconciles an already-registered class against a fresh PS roster pull:
+// new students are added (date-stamped so DobbsCore can prorate their do-now
+// requirement), students no longer on the PS roster are soft-withdrawn
+// (history kept, reversible), everyone else is left alone.
+
+// PS section entry date for a roster row, confirmed against a live PS
+// response (2026-09): it lives on the per-section enrollment record, not the
+// top-level student —
+//   s._enrollments: [{ sectiondcid, statuscode, enrolledlate, enrolleddate }]
+// A student can carry more than one enrollment stint in the same section
+// (dropped and re-added), so this filters to the requested section's dcid and
+// takes the latest enrolleddate among those. Falls back to undefined — which
+// tells the server to stamp the sync date instead — if PS ever omits it.
+function psEntryDate(s, sectionId) {
+    const entries = (s._enrollments || []).filter(e => String(e.sectiondcid) === String(sectionId));
+    if (!entries.length) return undefined;
+    const latest = entries.reduce((a, b) => (a.enrolleddate > b.enrolleddate ? a : b));
+    const d = String(latest.enrolleddate || '').slice(0, 10);
+    return /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : undefined;
+}
+
+function showResyncPanel(ctx, matchedClass) {
+    const panel = makePanel('Re-sync Roster');
+    panel.innerHTML += `
+        <div style="font-size:12px;color:#64748b;margin-bottom:12px;line-height:1.4">
+            Pulls the live PowerSchool roster for this section and reconciles it
+            against "${matchedClass.name}" in DobbsCore. Students no longer in PS
+            are withdrawn, not deleted — their history is kept.
+        </div>
+        <div id="ck-status" style="font-size:12px;color:#64748b;margin-bottom:12px;min-height:32px;line-height:1.4"></div>
+        <button id="ck-resync" style="width:100%;padding:9px;background:#d97706;color:#fff;border:none;border-radius:5px;font-size:13px;font-weight:600;cursor:pointer">Re-sync</button>
+    `;
+    document.getElementById('ck-close').onclick = () => { removeUI(); injectButton(ctx); };
+    document.getElementById('ck-resync').onclick = () => doResyncRoster(ctx, matchedClass.id);
+}
+
+async function doResyncRoster(ctx, classId) {
+    const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
+    if (!serverUrl || !teacherToken) { setStatus('Configure extension settings first.', '#dc2626'); return; }
+
+    const btn = document.getElementById('ck-resync');
+    btn.disabled = true; btn.textContent = 'Syncing…';
+    setStatus('Fetching PS roster…');
+
+    try {
+        const rosterResp = await fetch(`/ws/xte/student?section_ids=${ctx.sectionId}&status=A,P`);
+        if (!rosterResp.ok) throw new Error(`Roster fetch failed (${rosterResp.status})`);
+        const roster = await rosterResp.json();
+
+        const students = roster.map(s => ({
+            student_id:   s.studentnumber,
+            student_name: s.lastfirst,
+            ps_dcid:      s.id,
+            entry_date:   psEntryDate(s, ctx.sectionId),
+        }));
+
+        setStatus('Reconciling with DobbsCore…');
+        const resp = await chrome.runtime.sendMessage({
+            type:   'KENKEN_FETCH',
+            method: 'POST',
+            url:    `${serverUrl}/api/teacher/classes/${classId}/sync-roster`,
+            token:  teacherToken,
+            body:   { students }
+        });
+        if (!resp.ok) throw new Error(resp.error || `HTTP ${resp.status}`);
+
+        const { added, reactivated, withdrawn, unchanged } = resp.data;
+        setStatus(
+            `✓ Added ${added.length} · reactivated ${reactivated.length} · withdrew ${withdrawn.length} · ${unchanged} unchanged.`,
+            '#16a34a'
+        );
+    } catch (err) {
+        setStatus(`Error: ${err.message}`, '#dc2626');
+        console.error('[Re-sync Roster]', err);
+    }
+    btn.disabled = false; btn.textContent = 'Re-sync';
 }
 
 // ── Navigation detection (PowerSchool) ───────────────────────────────────────

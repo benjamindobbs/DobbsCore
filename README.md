@@ -16,6 +16,8 @@ PS API calls originating from the DobbsCore portal are routed through an open PS
 
 **Import Roster to DobbsCore** — appears on a PS class page when that section hasn't been registered in DobbsCore yet. Pulls the live PS roster (including PS student DCIDs for later attendance matching) and creates a matching class in DobbsCore in one click.
 
+**Re-sync Roster** — appears on a PS class page once the section is registered, alongside the other sync buttons. Pulls the live PS roster again and reconciles it against DobbsCore: students newly on the PS roster are added and date-stamped (with their PS section entry date when available, otherwise the sync date, which is what lets DobbsCore prorate their do-now requirement instead of expecting a full count from before they arrived); students no longer on the PS roster are withdrawn — not deleted, so their score history and WBL records are kept, and a later re-sync reactivates them if they return. Run this whenever a section's enrollment changes mid-year.
+
 **Create DobbsCore Assignment** — appears on a PS class page once the section is registered. Creates a new PS assignment (name, due date, max points, marking period category) and immediately scores it using computed DobbsCore activity grades for a teacher-selected date range.
 
 **Sync DobbsCore Grades** — appears on the PS score-entry page for an existing assignment. Scores the open assignment using DobbsCore activity grades for a selected date range without creating a new assignment.
@@ -94,6 +96,14 @@ The token expires periodically (roughly every hour). Return to DobbsCore, copy a
 3. Enter a class name and click **Import**.
 
 The class now appears in DobbsCore with all active students enrolled.
+
+### Re-syncing a class roster
+
+1. Navigate to the same class page in PS.
+2. Click **Re-sync Roster** (amber button, bottom-right).
+3. Click **Re-sync**.
+
+The panel reports what changed — students added, reactivated, or withdrawn, plus a count left unchanged. Nothing is deleted: a withdrawn student's scores and WBL history stay intact, and they're picked back up automatically if a later re-sync finds them on the PS roster again.
 
 ### Creating an activity assignment and syncing grades
 
