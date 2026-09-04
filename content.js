@@ -239,7 +239,7 @@ async function loadCategories(sectionId) {
 
         catSel.dataset.termid = section.termid;
 
-        const mBin = section._termbins.find(b => b.storecode.startsWith('M') && b._weights?.length);
+        const mBin = section._termbins.find(b => b._weights?.length);
         catSel.innerHTML = mBin
             ? mBin._weights.map(w => `<option value="${w.teachercategoryid}">${w.categoryname}</option>`).join('')
             : '<option value="">No categories found</option>';
@@ -250,7 +250,7 @@ async function loadCategories(sectionId) {
 
         const today   = new Date().toISOString().slice(0, 10);
         const current = section._termbins.find(
-            b => b.storecode.startsWith('M') && b._weights?.length && b.startdate <= today && today <= b.enddate
+            b => b._weights?.length && b.startdate <= today && today <= b.enddate
         );
         if (current) {
             catSel.dataset.storecode = current.storecode;
