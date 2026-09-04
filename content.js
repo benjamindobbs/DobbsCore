@@ -254,6 +254,10 @@ async function loadCategories(sectionId) {
         );
         if (current) {
             catSel.dataset.storecode = current.storecode;
+            // Real term bounds, stashed for Habits of Work sync — the server
+            // never talks to PS, so this is the only place those dates come from.
+            catSel.dataset.termstart = current.startdate;
+            catSel.dataset.termend   = current.enddate;
             const row = document.getElementById('ck-period-row');
             const lbl = document.getElementById('ck-period');
             if (row && lbl) { lbl.textContent = current.storecode; row.style.display = ''; }
@@ -317,7 +321,11 @@ async function doCreateAndSync(ctx) {
 
 // Creates a PS assignment and returns { assignmentId, assignmentsectionid }.
 // Throws on failure so callers can catch with a meaningful message.
-async function psCreateAssignment(name, duedate, dueDateObj, points, sectionsdcid, yearid, teachercategoryid) {
+// countedInFinalGrade defaults true for every existing flow (Skills,
+// Credentials, Work Events, activity grades); Habits of Work is the one
+// caller that passes false — district policy excludes it from the
+// traditional final grade.
+async function psCreateAssignment(name, duedate, dueDateObj, points, sectionsdcid, yearid, teachercategoryid, countedInFinalGrade = true) {
     const resp = await fetch('/ws/xte/section/assignment', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json;charset=UTF-8' },
@@ -327,7 +335,7 @@ async function psCreateAssignment(name, duedate, dueDateObj, points, sectionsdci
             yearid,
             _assignmentsections: [{
                 description: '', duedate, dueDateObj,
-                extracreditpoints: 0, iscountedinfinalgrade: true,
+                extracreditpoints: 0, iscountedinfinalgrade: countedInFinalGrade,
                 isscorespublish: true, isscoringneeded: true, maxretakeallowed: 0,
                 name, pointspossible: points, publishdaysbeforedue: 0,
                 publishonspecificdate: duedate, publishOnSpecificDateObj: dueDateObj,
@@ -386,24 +394,38 @@ async function psSubmitScores(scores) {
 
 // ── Work-Based Learning sync panel ────────────────────────────────────────────
 //
-// Three grains, mirroring the three scored lenses of the WBL framework:
-//   · Credentials  — one PS assignment per credential, partial credit by skills satisfied
-//   · Work Events  — one PS assignment per completed job, scored from its Holistic Call
-//   · Transfer     — one PS assignment per transfer skill, accumulating verified claims
+// Four grains, mirroring the scored lenses of the WBL framework:
+//   · Credentials     — one PS assignment per credential, partial credit by skills satisfied
+//   · Work Events     — one PS assignment per completed job, scored from its Holistic Call
+//   · Habits of Work  — one PS assignment per soft skill (3 dispositional + 2 transfer),
+//                        excluded from the traditional final grade per district policy
 //
-// QC spot checks and the dispositional Do Now / Exit Slip are deliberately never
-// synced: they are formative and carry no score by design.
+// QC spot checks and the dispositional Do Now / Exit Slip submissions themselves
+// are deliberately never synced — only the Habits of Work rating derived from
+// them is. See doHabitsSync.
 
-// Clones the category list into the summative selector and preselects a
-// summative-looking category. loadCategories() only populates #ck-category,
-// and the WBL panel needs two: formative for skills, summative for credentials.
+// Clones the category list into the summative and Habits of Work selectors.
+// loadCategories() only populates #ck-category (formative); the WBL panel
+// needs three. Habits of Work defaults to Formative too — there's no
+// dedicated PS category for it yet, so this selector exists to be repointed
+// once the district adds one, without a code change.
 function mirrorSummativeCategories() {
     const src = document.getElementById('ck-category');
     const dst = document.getElementById('ck-category-summ');
+    const hw  = document.getElementById('ck-category-hw');
+    if (hw && src) hw.innerHTML = src.innerHTML;
     if (!src || !dst) return;
     dst.innerHTML = src.innerHTML;
     const summ = Array.from(dst.options).find(o => o.textContent.toLowerCase().includes('summative'));
     if (summ) summ.selected = true;
+}
+
+const SYNC_STATE_LABELS = { not_started: 'Not Started', in_progress: 'In Progress', due: 'Due' };
+function stateSelect(cls, value, dataAttrs) {
+    return `<select class="${cls}" ${dataAttrs} style="font-size:11px;padding:2px 4px;border:1px solid #cbd5e1;border-radius:4px">
+        ${Object.entries(SYNC_STATE_LABELS).map(([v, label]) =>
+            `<option value="${v}" ${v === value ? 'selected' : ''}>${label}</option>`).join('')}
+    </select>`;
 }
 
 function showWblSyncPanel(ctx, classId, programs) {
@@ -414,23 +436,29 @@ function showWblSyncPanel(ctx, classId, programs) {
             `<option value="${p.id}">${p.name}</option>`).join('')}</select>`)}
         ${field('Formative Category', `<select id="ck-category" ${IS}><option value="">Loading…</option></select>`)}
         ${field('Summative Category', `<select id="ck-category-summ" ${IS}><option value="">Loading…</option></select>`)}
+        ${field('Habits of Work Category', `<select id="ck-category-hw" ${IS}><option value="">Loading…</option></select>`)}
+        <p style="font-size:11px;color:#94a3b8;margin:-6px 0 10px;line-height:1.4">
+            Defaults to Formative until the district adds a dedicated category — repoint it here once that exists.
+        </p>
         <div id="ck-period-row" style="display:none;margin-bottom:10px">
             <span style="font-size:11px;color:#64748b;font-weight:500;text-transform:uppercase;letter-spacing:.04em">Marking Period</span>
             <span id="ck-period" style="display:block;font-size:13px;margin-top:3px"></span>
         </div>
         ${field('Due Date',              `<input id="ck-due"        type="date"   value="${today}" ${IS}>`)}
         ${field('Work Event Max Points', `<input id="ck-we-points"   type="number" value="20" min="0.01" step="0.01" ${IS}>`)}
-        ${field('Transfer Max Points',   `<input id="ck-tr-points"   type="number" value="10" min="0.01" step="0.01" ${IS}>`)}
+        ${field('Habits of Work Max Points', `<input id="ck-hw-points"   type="number" value="10" min="0.01" step="0.01" ${IS}>`)}
         <p style="font-size:11px;color:#94a3b8;margin:-2px 0 10px;line-height:1.45">
-            Skills and credentials are completion grades, scored 0 or 100.
+            Skills and credentials are completion grades, scored 0/100 when Due
+            or 100/blank when In Progress. Not Started items are excluded from sync.
         </p>
+        <div id="ck-wbl-states" style="margin-bottom:10px"></div>
         <div id="ck-wbl-jobs" style="margin-bottom:10px"></div>
         <div id="ck-status" style="font-size:12px;color:#64748b;margin-bottom:12px;min-height:32px;line-height:1.4"></div>
         <div style="display:flex;flex-direction:column;gap:6px">
             <button id="ck-wbl-skills" style="padding:9px;background:#2563eb;color:#fff;border:none;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer">Sync Skills (Formative)</button>
             <button id="ck-wbl-cred" style="padding:9px;background:#0f172a;color:#fff;border:none;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer">Sync Credentials (Summative)</button>
             <button id="ck-wbl-we"   style="padding:9px;background:#c2410c;color:#fff;border:none;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer">Sync Selected Work Events</button>
-            <button id="ck-wbl-tr"   style="padding:9px;background:#7c3aed;color:#fff;border:none;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer">Sync Transfer Skills</button>
+            <button id="ck-wbl-hw"   style="padding:9px;background:#7c3aed;color:#fff;border:none;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer">Sync Habits of Work</button>
         </div>
     `;
     document.getElementById('ck-close').onclick = () => { removeUI(); injectButton(ctx); };
@@ -445,13 +473,38 @@ function showWblSyncPanel(ctx, classId, programs) {
         });
         if (!gs.ok) return;
         const set = (id, v) => { const el = document.getElementById(id); if (el && v != null) el.value = v; };
-        set('ck-we-points',   gs.data.wbl_holistic_max_score);
-        set('ck-tr-points',   gs.data.wbl_transfer_max_score);
+        set('ck-we-points', gs.data.wbl_holistic_max_score);
+        // Shared ceiling for all 5 Habits of Work assignments — same column
+        // that used to back Transfer Max Points alone.
+        set('ck-hw-points', gs.data.wbl_transfer_max_score);
     })();
 
     let cache = null;   // last /sync/progress payload
 
-    const refreshJobs = async () => {
+    // A credential-level toggle bulk-sets its skills server-side (one-time
+    // cascade, not a lock — a skill row can still be nudged independently
+    // right after). Both PATCH handlers just re-run refresh() to pick up
+    // whatever the server actually did rather than guessing locally.
+    const setCredentialState = async (credId, state) => {
+        const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
+        await chrome.runtime.sendMessage({
+            type: 'KENKEN_FETCH', method: 'PATCH',
+            url: `${serverUrl}/api/wbl/credentials/${credId}/state`, token: teacherToken,
+            body: { class_id: classId, state },
+        });
+        refresh();
+    };
+    const setSkillState = async (credId, skillId, state) => {
+        const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
+        await chrome.runtime.sendMessage({
+            type: 'KENKEN_FETCH', method: 'PATCH',
+            url: `${serverUrl}/api/wbl/credential-skills/${credId}/${skillId}/state`, token: teacherToken,
+            body: { class_id: classId, state },
+        });
+        refresh();
+    };
+
+    const refresh = async () => {
         const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
         const resp = await chrome.runtime.sendMessage({
             type: 'KENKEN_FETCH',
@@ -462,9 +515,35 @@ function showWblSyncPanel(ctx, classId, programs) {
         cache = resp.data;
         const progId = Number(document.getElementById('ck-wbl-prog').value);
         const block  = cache.programs.find(p => p.program.id === progId);
-        const jobs   = block?.work_events ?? [];
-        const el = document.getElementById('ck-wbl-jobs');
-        el.innerHTML = jobs.length
+
+        const creds = block?.credentials ?? [];
+        const statesEl = document.getElementById('ck-wbl-states');
+        statesEl.innerHTML = creds.length
+            ? `<span style="font-size:11px;color:#64748b;font-weight:500;text-transform:uppercase;letter-spacing:.04em">Credential / Skill Sync State</span>
+               <div style="max-height:180px;overflow-y:auto;border:1px solid #e2e8f0;border-radius:4px;padding:6px;margin-top:3px">
+                 ${creds.map(c => `
+                   <div style="display:flex;justify-content:space-between;align-items:center;padding:2px 0;font-size:12px;font-weight:600">
+                     <span>${c.name}</span>
+                     ${stateSelect('ck-wbl-cred-state', c.state, `data-cred="${c.credential_id}"`)}
+                   </div>
+                   ${c.skills.map(sk => `
+                     <div style="display:flex;justify-content:space-between;align-items:center;padding:2px 0 2px 14px;font-size:11px;color:#475569">
+                       <span>${sk.name}</span>
+                       ${stateSelect('ck-wbl-skill-state', sk.state, `data-cred="${c.credential_id}" data-skill="${sk.skill_id}"`)}
+                     </div>`).join('')}
+                 `).join('')}
+               </div>`
+            : '<span style="font-size:12px;color:#94a3b8">No credentials in this program yet.</span>';
+        statesEl.querySelectorAll('.ck-wbl-cred-state').forEach(sel => {
+            sel.onchange = () => setCredentialState(sel.dataset.cred, sel.value);
+        });
+        statesEl.querySelectorAll('.ck-wbl-skill-state').forEach(sel => {
+            sel.onchange = () => setSkillState(sel.dataset.cred, sel.dataset.skill, sel.value);
+        });
+
+        const jobs = block?.work_events ?? [];
+        const jobsEl = document.getElementById('ck-wbl-jobs');
+        jobsEl.innerHTML = jobs.length
             ? `<span style="font-size:11px;color:#64748b;font-weight:500;text-transform:uppercase;letter-spacing:.04em">Completed Work Events</span>
                <div style="max-height:132px;overflow-y:auto;border:1px solid #e2e8f0;border-radius:4px;padding:6px;margin-top:3px">
                  ${jobs.map(j => `
@@ -476,21 +555,25 @@ function showWblSyncPanel(ctx, classId, programs) {
                </div>`
             : '<span style="font-size:12px;color:#94a3b8">No completed work events yet.</span>';
     };
-    document.getElementById('ck-wbl-prog').onchange = refreshJobs;
-    refreshJobs();
+    document.getElementById('ck-wbl-prog').onchange = refresh;
+    refresh();
 
     const readForm = () => {
-        const catSel = document.getElementById('ck-category');
+        const catSel  = document.getElementById('ck-category');
         const summSel = document.getElementById('ck-category-summ');
+        const hwSel   = document.getElementById('ck-category-hw');
         const f = {
             duedate:   document.getElementById('ck-due')?.value,
             wePts:     parseFloat(document.getElementById('ck-we-points')?.value),
-            trPts:     parseFloat(document.getElementById('ck-tr-points')?.value),
+            hwPts:     parseFloat(document.getElementById('ck-hw-points')?.value),
             progId:    Number(document.getElementById('ck-wbl-prog')?.value),
-            teachercategoryid:     Number(catSel?.value),
-            summcategoryid:        Number(summSel?.value) || Number(catSel?.value),
-            termid:    Number(catSel?.dataset.termid),
-            storecode: catSel?.dataset.storecode,
+            teachercategoryid: Number(catSel?.value),
+            summcategoryid:    Number(summSel?.value) || Number(catSel?.value),
+            hwcategoryid:      Number(hwSel?.value)   || Number(catSel?.value),
+            termid:     Number(catSel?.dataset.termid),
+            storecode:  catSel?.dataset.storecode,
+            termstart:  catSel?.dataset.termstart,
+            termend:    catSel?.dataset.termend,
         };
         if (!f.duedate)            { setStatus('Select a due date.', '#dc2626'); return null; }
         if (!f.teachercategoryid)  { setStatus('Select a category.', '#dc2626'); return null; }
@@ -502,11 +585,12 @@ function showWblSyncPanel(ctx, classId, programs) {
     const run = async (kind) => {
         const f = readForm();
         if (!f) return;
-        const btns = ['ck-wbl-skills', 'ck-wbl-cred', 'ck-wbl-we', 'ck-wbl-tr'].map(id => document.getElementById(id));
+        const btns = ['ck-wbl-skills', 'ck-wbl-cred', 'ck-wbl-we', 'ck-wbl-hw'].map(id => document.getElementById(id));
         btns.forEach(b => { b.disabled = true; b.style.opacity = '0.6'; });
         try {
-            await doWblSync(ctx, classId, kind, f, cache);
-            await refreshJobs();
+            if (kind === 'habits') await doHabitsSync(ctx, classId, f);
+            else await doWblSync(ctx, classId, kind, f, cache);
+            await refresh();
         } catch (err) {
             setStatus('Error: ' + err.message, '#dc2626');
             console.error('[DobbsCore WBL sync]', err);
@@ -517,7 +601,7 @@ function showWblSyncPanel(ctx, classId, programs) {
     document.getElementById('ck-wbl-skills').onclick = () => run('skills');
     document.getElementById('ck-wbl-cred').onclick = () => run('credentials');
     document.getElementById('ck-wbl-we').onclick   = () => run('work_events');
-    document.getElementById('ck-wbl-tr').onclick   = () => run('transfer');
+    document.getElementById('ck-wbl-hw').onclick   = () => run('habits');
 }
 
 async function doWblSync(ctx, classId, kind, f, cache) {
@@ -576,25 +660,30 @@ async function doWblSync(ctx, classId, kind, f, cache) {
     };
 
     const round2 = n => Math.round(n * 100) / 100;
-    const idsBack = { class_id: classId, skills: [], credentials: [], work_events: [], transfer: [] };
+    const idsBack = { class_id: classId, skills: [], credentials: [], work_events: [] };
     let summary = '';
 
-    // Formative: one 0/100 completion assignment per skill within a credential.
+    // Formative: one completion assignment per skill within a credential.
     // Keyed on the pair because the same skill can be satisfied for one
-    // credential and not another with a stricter threshold.
+    // credential and not another with a stricter threshold. Not Started
+    // skills are excluded entirely; In Progress earners still get 100 but
+    // non-earners are left blank rather than zeroed; Due is the hard 0/100
+    // rule. See the Credential/Skill Sync State list in the panel.
     if (kind === 'skills') {
-        const creds = block.credentials.filter(c => c.sync_enabled && c.skills.length);
-        if (!creds.length) throw new Error('No credential skills to sync.');
-        const total = creds.reduce((n, c) => n + c.skills.filter(sk => sk.sync_enabled).length, 0);
+        const creds = block.credentials.filter(c => c.skills.some(sk => sk.state !== 'not_started'));
+        if (!creds.length) throw new Error('No credential skills staged for sync — set at least one to In Progress or Due.');
+        const total = creds.reduce((n, c) => n + c.skills.filter(sk => sk.state !== 'not_started').length, 0);
         let done = 0, unmatched = [], satisfiedCount = 0;
         for (const c of creds) {
-            for (const sk of c.skills.filter(x => x.sync_enabled)) {
+            for (const sk of c.skills.filter(x => x.state !== 'not_started')) {
                 setStatus(`Syncing “${sk.name}” (${++done}/${total})…`);
                 const { assignmentId, assignmentsectionid } = await resolveAssignment(
                     sk, `${block.program.name}: ${c.name} — ${sk.name}`, COMPLETION, f.teachercategoryid);
                 const met = new Set(sk.satisfied);
-                const res = await submitFor(assignmentId, assignmentsectionid,
-                    sid => (met.has(sid) ? COMPLETION : 0));
+                const res = await submitFor(assignmentId, assignmentsectionid, sid => {
+                    if (met.has(sid)) return COMPLETION;
+                    return sk.state === 'due' ? 0 : null;   // in_progress: leave non-earners blank
+                });
                 unmatched = res.unmatched;
                 satisfiedCount += met.size;
                 idsBack.skills.push({
@@ -608,11 +697,12 @@ async function doWblSync(ctx, classId, kind, f, cache) {
         if (unmatched.length) summary += ` ${unmatched.length} unmatched.`;
     }
 
-    // Summative: the credential itself, 0/100, earned or not. A credential
-    // rests on a complete evidence trail, so there is no partial credit.
+    // Summative: the credential itself. A credential rests on a complete
+    // evidence trail, so there is no partial credit — just the same
+    // Not Started/In Progress/Due handling as skills above.
     if (kind === 'credentials') {
-        const creds = block.credentials.filter(c => c.sync_enabled);
-        if (!creds.length) throw new Error('No credentials to sync.');
+        const creds = block.credentials.filter(c => c.state !== 'not_started');
+        if (!creds.length) throw new Error('No credentials staged for sync — set at least one to In Progress or Due.');
         let done = 0, unmatched = [];
         for (const c of creds) {
             setStatus(`Syncing “${c.name}” (${++done}/${creds.length})…`);
@@ -624,7 +714,8 @@ async function doWblSync(ctx, classId, kind, f, cache) {
                 // Earned in another class or a previous year: its grade already
                 // landed there, so leave this term's assignment untouched.
                 if (prior.has(sid) && !here.has(sid)) return null;
-                return here.has(sid) ? COMPLETION : 0;
+                if (here.has(sid)) return COMPLETION;
+                return c.state === 'due' ? 0 : null;   // in_progress: leave non-earners blank
             });
             unmatched = res.unmatched;
             idsBack.credentials.push({
@@ -667,31 +758,6 @@ async function doWblSync(ctx, classId, kind, f, cache) {
         if (unmatched.length) summary += ` ${unmatched.length} unmatched.`;
     }
 
-    if (kind === 'transfer') {
-        const LABEL = { application: 'Application of Previous Knowledge', extension: 'Extension of Knowledge' };
-        let done = 0, unmatched = [], scored = 0;
-        for (const t of block.transfer) {
-            if (t.sync_enabled === 0) continue;
-            setStatus(`Syncing ${LABEL[t.kind]} (${++done}/${block.transfer.length})…`);
-            const { assignmentId, assignmentsectionid } =
-                await resolveAssignment(t, `${block.program.name}: ${LABEL[t.kind]}`, f.trPts, f.summcategoryid);
-            const byStudent = Object.fromEntries(t.scores.map(s => [s.student_id, s]));
-            const res = await submitFor(assignmentId, assignmentsectionid, sid => {
-                const s = byStudent[sid];
-                if (!s) return null;              // no verified claim yet — leave blank
-                return round2(Math.min(s.score, f.trPts));
-            });
-            scored += res.count; unmatched = res.unmatched;
-            idsBack.transfer.push({
-                kind: t.kind,
-                ps_assignment_id: String(assignmentId),
-                ps_assignmentsection_id: String(assignmentsectionid),
-            });
-        }
-        summary = `✓ Transfer skills synced. ${scored} score(s) submitted.`;
-        if (unmatched.length) summary += ` ${unmatched.length} unmatched.`;
-    }
-
     // Hand the PS assignment ids back so the next sync updates these
     // assignments instead of creating duplicates.
     await chrome.runtime.sendMessage({
@@ -700,6 +766,97 @@ async function doWblSync(ctx, classId, kind, f, cache) {
         token: teacherToken,
         body: idsBack,
     });
+    setStatus(summary, '#16a34a');
+}
+
+// Habits of Work: all 5 soft skills (3 dispositional + 2 transfer) in one
+// click. Unlike doWblSync above, this doesn't use /sync/progress — it needs
+// the PS marking period's actual start/end dates (the server never talks to
+// PS), and Transfer kinds may be entirely absent from the response (gated on
+// Phase 2 — see GET /sync/habits). Every assignment here is created with
+// iscountedinfinalgrade: false, district policy for this category.
+async function doHabitsSync(ctx, classId, f) {
+    const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
+    const yearid     = Math.floor(f.termid / 100);
+    const dueDateObj = new Date(f.duedate + 'T12:00:00').toISOString();
+
+    if (!f.termstart || !f.termend) throw new Error('Could not determine the active marking period\'s dates.');
+
+    setStatus('Fetching Habits of Work progress…');
+    const resp = await chrome.runtime.sendMessage({
+        type: 'KENKEN_FETCH',
+        url:  `${serverUrl}/api/wbl/sync/habits?class_id=${classId}&term_start=${f.termstart}&term_end=${f.termend}`,
+        token: teacherToken
+    });
+    if (!resp.ok) throw new Error('Failed to fetch Habits of Work progress.');
+    const data  = resp.data;
+    const block = data.programs.find(p => p.program.id === f.progId);
+    if (!block) throw new Error('Program is not linked to this class.');
+    // Defensive only — the 3 dispositional codes are never gated, so this
+    // array is empty only if the program's soft-skill catalog is somehow
+    // missing entirely. Transfer's 2 codes are the ones that can be absent
+    // (hidden until a student reaches Phase 2) without emptying the array.
+    if (!block.habits.length) throw new Error('Nothing to sync.');
+
+    setStatus('Fetching class roster…');
+    const rosterResp = await fetch(`/ws/xte/student?section_ids=${ctx.sectionId}&status=A,P`);
+    if (!rosterResp.ok) throw new Error(`Roster fetch failed (${rosterResp.status})`);
+    const dcidMap = {};
+    for (const s of await rosterResp.json()) dcidMap[s.studentnumber] = s.dcid;
+
+    const resolveAssignment = async (existing, name) => {
+        if (existing?.ps_assignment_id) {
+            const r = await fetch(`/ws/xte/section/assignment/${existing.ps_assignment_id}`);
+            if (r.ok) {
+                const d = await r.json();
+                const sec = d._assignmentsections?.find(s => String(s.sectionsdcid) === String(ctx.sectionId));
+                const asid = Array.isArray(sec?.assignmentsectionid) ? sec.assignmentsectionid[0] : sec?.assignmentsectionid;
+                if (asid) return { assignmentId: existing.ps_assignment_id, assignmentsectionid: asid };
+            }
+        }
+        return psCreateAssignment(name, f.duedate, dueDateObj, f.hwPts, Number(ctx.sectionId), yearid,
+                                  f.hwcategoryid, false);
+    };
+
+    const round2 = n => Math.round(n * 100) / 100;
+    const habitsBack = [];
+    let done = 0, unmatched = [], scored = 0;
+    for (const h of block.habits) {
+        setStatus(`Syncing “${h.name}” (${++done}/${block.habits.length})…`);
+        const { assignmentId, assignmentsectionid } = await resolveAssignment(h, `${block.program.name}: ${h.name}`);
+        const byStudent = Object.fromEntries(h.scores.map(s => [s.student_id, s]));
+        const scores = [], localUnmatched = [];
+        for (const sid of Object.keys(byStudent)) {
+            const dcid = dcidMap[sid];
+            if (!dcid) { localUnmatched.push(sid); continue; }
+            // Dispositional scores are already 0-100 (dispositionalScore's
+            // cumulative average) — scale against hwPts like any completion
+            // grade. Transfer's raw claim-score sum is capped at hwPts and
+            // used directly as the point value, matching how it scored
+            // before this was unified into one button.
+            const pointValue = h.category === 'transfer'
+                ? Math.min(byStudent[sid].score, f.hwPts)
+                : round2((byStudent[sid].score / 100) * f.hwPts);
+            scores.push(psScoreEntry(dcid, pointValue, assignmentsectionid, assignmentId, ctx.sectionId));
+        }
+        if (scores.length) await psSubmitScores(scores);
+        scored += scores.length; unmatched = localUnmatched;
+        habitsBack.push({
+            code: h.code,
+            ps_assignment_id: String(assignmentId),
+            ps_assignmentsection_id: String(assignmentsectionid),
+        });
+    }
+
+    await chrome.runtime.sendMessage({
+        type: 'KENKEN_FETCH', method: 'POST',
+        url:  `${serverUrl}/api/wbl/sync/ids`,
+        token: teacherToken,
+        body: { class_id: classId, habits: habitsBack },
+    });
+
+    let summary = `✓ ${block.habits.length} Habits of Work assignment(s). ${scored} score(s) submitted.`;
+    if (unmatched.length) summary += ` ${unmatched.length} unmatched.`;
     setStatus(summary, '#16a34a');
 }
 
@@ -924,7 +1081,11 @@ if (window.location.hostname.includes('powerschool.com')) {
 
 // ── DobbsCore portal injection ────────────────────────────────────────────────
 // Runs when the extension is loaded on the DobbsCore teacher portal.
-// Watches for the WBL Roster tab and injects a "Sync Attendance from PS" button.
+// Watches for either anchor and injects a "Sync Attendance from PS" button:
+// the WBL Roster tab's (pulls for that program's linked classes) or the
+// Classes list view's (pulls for every registered class, WBL or not — see
+// doPullAttendance, which loops all classes regardless of which anchor
+// triggered it).
 
 if (window.location.hostname.includes('powerschool.com')) {
     // On the PS attendance page: auto-capture JS vars into chrome.storage.local
@@ -933,11 +1094,17 @@ if (window.location.hostname.includes('powerschool.com')) {
         captureAttendanceFromPage();
     }
 } else {
-    // On DobbsCore portal: watch for the WBL Roster tab and inject the sync button
+    // On DobbsCore portal: watch for either anchor and inject the sync button
+    const ATTENDANCE_ANCHOR_IDS = ['wbl-attendance-sync', 'classes-attendance-sync'];
     const attObserver = new MutationObserver(() => {
-        const actionsEl = document.getElementById('wbl-attendance-sync');
-        if (actionsEl && !document.getElementById('ck-pull-att-btn')) {
-            injectPullAttendanceButton(actionsEl);
+        // Global existence check, not per-anchor: the two anchors live in
+        // mutually exclusive SPA views, so only one is ever mounted at a
+        // time — and the button's id must stay unique on the page since
+        // doPullAttendance looks it up by that id.
+        if (document.getElementById('ck-pull-att-btn')) return;
+        for (const id of ATTENDANCE_ANCHOR_IDS) {
+            const actionsEl = document.getElementById(id);
+            if (actionsEl) { injectPullAttendanceButton(actionsEl); break; }
         }
     });
     attObserver.observe(document.body, { childList: true, subtree: true });
@@ -1022,10 +1189,17 @@ function mdToIso(md) {
     return `${year}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
 }
 
-// Bulk direct ingest: the whole cached date range for every class linked to
-// the selected WBL program, posted straight to the server in one shot per
-// class — no per-date review step. Trusts PS as the source of truth; the
-// only manual override is the "Called Out" button on the roster itself.
+// Bulk direct ingest: the whole cached date range for a set of classes,
+// posted straight to the server in one shot per class — no per-date review
+// step. Trusts PS as the source of truth; the only manual override is the
+// "Called Out" button on the roster itself.
+//
+// Two entry points, same underlying loop: from the WBL Roster tab (a
+// #wbl-program-select is present) this pulls only that program's linked
+// classes, exactly as before; from the Classes list view (no such selector)
+// it pulls every registered class, WBL-linked or not, since meeting-day-aware
+// activity-grade proration (server/routes/teacher.js) benefits from
+// attendance regardless of whether a class has any WBL program attached.
 async function doPullAttendance() {
     const btn      = document.getElementById('ck-pull-att-btn');
     const statusEl = document.getElementById('ck-pull-att-status');
@@ -1034,7 +1208,6 @@ async function doPullAttendance() {
     };
 
     const programId = document.getElementById('wbl-program-select')?.value;
-    if (!programId) { setPS('Select a program first.', '#dc2626'); return; }
 
     btn.disabled = true; btn.textContent = 'Syncing...'; setPS('');
 
@@ -1045,12 +1218,23 @@ async function doPullAttendance() {
 
         const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
 
-        const [wblClassesResp, allClassesResp] = await Promise.all([
-            chrome.runtime.sendMessage({ type: 'KENKEN_FETCH', url: `${serverUrl}/api/wbl/programs/${programId}/classes`, token: teacherToken }),
-            chrome.runtime.sendMessage({ type: 'KENKEN_FETCH', url: `${serverUrl}/api/teacher/classes`, token: teacherToken }),
-        ]);
-        if (!wblClassesResp.ok || !allClassesResp.ok) { setPS('Could not load linked classes from DobbsCore.', '#dc2626'); return; }
-        if (!wblClassesResp.data.length) { setPS('This program has no linked classes yet.', '#dc2626'); return; }
+        const allClassesResp = await chrome.runtime.sendMessage({
+            type: 'KENKEN_FETCH', url: `${serverUrl}/api/teacher/classes`, token: teacherToken
+        });
+        if (!allClassesResp.ok) { setPS('Could not load classes from DobbsCore.', '#dc2626'); return; }
+
+        let targetClasses;
+        if (programId) {
+            const wblClassesResp = await chrome.runtime.sendMessage({
+                type: 'KENKEN_FETCH', url: `${serverUrl}/api/wbl/programs/${programId}/classes`, token: teacherToken
+            });
+            if (!wblClassesResp.ok) { setPS('Could not load linked classes from DobbsCore.', '#dc2626'); return; }
+            if (!wblClassesResp.data.length) { setPS('This program has no linked classes yet.', '#dc2626'); return; }
+            targetClasses = wblClassesResp.data;
+        } else {
+            if (!allClassesResp.data.length) { setPS('No classes registered yet.', '#dc2626'); return; }
+            targetClasses = allClassesResp.data;
+        }
 
         const sectionByClassId = {};
         for (const c of allClassesResp.data) sectionByClassId[c.id] = c.ps_section_id;
@@ -1058,7 +1242,7 @@ async function doPullAttendance() {
         const allCached = await chrome.storage.local.get(null);
         let totalImported = 0, totalUnmatched = 0, classesSynced = 0;
 
-        for (const cls of wblClassesResp.data) {
+        for (const cls of targetClasses) {
             const psSectionId = sectionByClassId[cls.id];
             if (!psSectionId) continue;   // no PS section linked to this class
 

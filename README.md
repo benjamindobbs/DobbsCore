@@ -22,19 +22,27 @@ PS API calls originating from the DobbsCore portal are routed through an open PS
 
 **Sync DobbsCore Grades** — appears on the PS score-entry page for an existing assignment. Scores the open assignment using DobbsCore activity grades for a selected date range without creating a new assignment.
 
-**Sync Work-Based Learning** — appears on a PS class page once the section is registered and linked to a WBL program in DobbsCore. Syncs the three scored WBL lenses independently, each its own button:
+**Sync Work-Based Learning** — appears on a PS class page once the section is registered and linked to a WBL program in DobbsCore. Syncs the hard-skill and job lenses independently, each its own button:
 
-- *Sync Skills (Formative)* — one 0/100 completion assignment per (credential, skill) pair: 100 if the student has satisfied that skill's required demonstrations toward that credential, 0 otherwise.
-- *Sync Credentials (Summative)* — one 0/100 assignment per credential: 100 if earned in this class this term, 0 otherwise. A credential earned in a prior class or year is left unscored here — its grade already landed where it was earned.
+- *Sync Skills (Formative)* — one completion assignment per (credential, skill) pair, gated by that pair's sync state (see below): excluded if Not Started, 100/blank if In Progress, 100/0 if Due.
+- *Sync Credentials (Summative)* — one assignment per credential, same three-state gating. A credential earned in a prior class or year is left unscored here regardless of state — its grade already landed where it was earned.
 - *Sync Selected Work Events* — one assignment per completed Work Event you check off, scored from its Holistic Call tier (blended with the student's attendance ratio for that job's window when attendance data has been pulled — see below).
-- *Sync Transfer Skills* — one assignment per transfer kind (Application of Previous Knowledge, Extension of Knowledge), scored from the sum of verified transfer-claim scores.
 
-QC Spot Checks and the dispositional Do Now / Exit Slip lens are formative by design and never sync to PS. PS assignment IDs are saved back to DobbsCore after each sync so re-syncing updates the same assignments instead of creating duplicates.
+**Credential/Skill Sync State** — a list in the same panel, above the sync buttons: every credential in the linked program, each with a **Not Started / In Progress / Due** selector, and an indented selector per required skill. Changing a credential's state immediately bulk-sets the same state on all its skills (a one-time cascade, not a lock — a skill can still be nudged back independently right after). A credential/skill starts Not Started and is excluded from sync entirely; the moment any student on the roster shows any evidence toward it (a mastered assessment or a Skill Check), it automatically promotes itself to In Progress the next time this panel loads — no click needed. In Progress means students who've earned it score 100 and everyone else is left blank, not zeroed; flip it to Due once you're ready for the hard 0/100 rule. Selections save immediately, per class.
 
-**Sync Attendance from PS** — lives in the DobbsCore teacher portal's WBL **Roster** tab, not on a PS page. Two-step flow that feeds the attendance blend used by *Sync Selected Work Events* above:
+QC Spot Checks and the dispositional Do Now / Exit Slip submissions themselves are never synced — only the Habits of Work rating derived from Exit Slips is (see below).
+
+**Sync Habits of Work** — same panel, syncs all 5 soft skills (Persistence, Commitment to Excellence, Academic Curiosity, Application of Previous Knowledge, Extension of Knowledge) in one click, one assignment each:
+
+- The 3 dispositional skills score from a **cumulative rating average for the current PS marking period** — see Grade calculation below for exactly how a day counts.
+- The 2 transfer skills score from the sum of verified transfer-claim scores, same as before. **Both are hidden from sync entirely — no assignment created or touched — until at least one student in the class has reached Phase 2.** A still-Phase-1 student stays blank on them even after the class unlocks.
+
+Every Habits of Work assignment is created with **"Count in Traditional Final Grade" off** (district policy for this category) and defaults to the Formative category via its own selector in the panel — repoint that once the district adds a dedicated category.
+
+**Sync Attendance from PS** — a button that appears in two places: the DobbsCore portal's WBL **Roster** tab (pulls only that program's linked classes, as before) and the **Classes** list view (pulls for every registered class, WBL-linked or not — meeting-day-aware activity-grade proration, below, benefits from attendance regardless of whether a class has any WBL program attached). Two-step flow either way:
 
 1. Open the PS **Attendance Grid** page for a section. The extension automatically reads the grid's embedded attendance data and caches it in browser storage (a toast confirms how many students/dates were captured).
-2. Back in the DobbsCore portal's WBL Roster tab, click **Sync Attendance from PS**. It matches the selected program's linked classes to their cached PS sections (by student DCID overlap if the section IDs don't line up), and bulk-imports every cached date for each — no per-date review step. `UNV` (Unverified Absence) counts against a student's ratio unless a teacher has logged a "Called Out" override for that date on the WBL Roster; `UXT` (Unexcused Tardy) counts as half credit; everything else counts as present.
+2. Click **Sync Attendance from PS** from whichever entry point applies. It matches classes to their cached PS sections (by student DCID overlap if the section IDs don't line up) and bulk-imports every cached date for each — no per-date review step. `UNV` (Unverified Absence) counts against a student's ratio unless a teacher has logged a "Called Out" override for that date on the WBL Roster; `UXT` (Unexcused Tardy) counts as half credit; everything else counts as present.
 
 ### Grade calculation
 
@@ -48,13 +56,25 @@ Students who haven't linked their DobbsCore account receive the no-submission sc
 
 A student who enrolled partway through the selected date range has their required activity count prorated by the fraction of the window they were actually on the roster for (based on the PS section entry date captured by **Re-sync Roster** below), rather than being scored as if they'd been enrolled the whole time. A student whose enrollment doesn't overlap the window at all is left unscored rather than given a zero.
 
+That proration is **school-day-aware, not just calendar-day**, whenever PS attendance has been pulled for the class (see Sync Attendance from PS above — it now covers every class, not only WBL ones): the window and the student's enrolled slice of it are both counted in actual meeting days, so a window spanning a weekend or a holiday doesn't inflate the denominator. Falls back to plain calendar-day counting for any class that hasn't had attendance pulled yet.
+
 **Work-Based Learning scores** are computed server-side by DobbsCore and are all completion or tier-based, never partial-credit fractions:
 
-- *Skills* and *Credentials*: 100 if satisfied/earned, 0 otherwise (see Flows above).
+- *Skills* and *Credentials*: 100 if satisfied/earned; otherwise 0 if the item's sync state is Due, or left blank if In Progress (see the Credential/Skill Sync State list in Flows above).
 - *Work Events*: the Holistic Call tier's configured point percentage, blended 80/20 with the student's attendance ratio for that job's window when attendance has been pulled for the relevant PS section — otherwise the raw tier percentage.
-- *Transfer*: the sum of an instructor's verified transfer-claim scores, capped at the configured max.
 
-Default max-points values for all flows are pre-filled from the teacher's DobbsCore gradebook settings.
+**Habits of Work scores**, computed server-side, split by soft skill:
+
+- *Application of Previous Knowledge* / *Extension of Knowledge* (transfer): the sum of an instructor's verified transfer-claim scores, capped at the configured max — unchanged from before, now just gated on Phase 2 and excluded from the final grade.
+- *Persistence* / *Commitment to Excellence* / *Academic Curiosity* (dispositional): a **cumulative average over the current PS marking period**, one value per school day the class met:
+  - No Do Now submitted that day at all → **0** for all three dispositional skills that day.
+  - A Do Now was submitted but this skill wasn't one of its (at most two) picks → **excluded** from this skill's average — not a data point at all.
+  - This skill was picked and the resulting Exit Slip was voided, or never followed through on → **0**.
+  - The resulting Exit Slip is submitted but not yet verified by the teacher (student-claimed only) → **excluded** — doesn't count either way until reviewed.
+  - The resulting Exit Slip was verified or witnessed with a 0–4 rating (picked by the teacher when verifying, in the DobbsCore portal's Exit Slips tab) → **rating × 25** (0/25/50/75/100).
+  - The average of everything that counted is the score. A student with zero countable days that period is left blank.
+
+Default max-points values for all flows are pre-filled from the teacher's DobbsCore gradebook settings; Habits of Work's max points is the same setting Transfer used to use alone, now shared across all 5.
 
 ---
 
@@ -125,23 +145,31 @@ The extension will create the PS assignment, fetch DobbsCore grades, and submit 
 3. Select the DobbsCore class and date range.
 4. Click **Sync Grades**.
 
+### Setting a credential or skill's sync state
+
+1. Open the **Sync Work-Based Learning** panel (below).
+2. Under **Credential / Skill Sync State**, pick **Not Started**, **In Progress**, or **Due** for a credential — it immediately cascades to every skill it requires — or adjust one skill's selector independently afterward.
+3. Selections save as you make them; no separate save step.
+
+New credentials/skills start Not Started and stay invisible to sync until either you flip them or a student shows any evidence toward one, which auto-promotes it to In Progress the next time the panel loads.
+
 ### Syncing Work-Based Learning grades
 
 1. Navigate to a registered class page in PS. This button only appears if the class is linked to a WBL program in DobbsCore.
 2. Click **Sync Work-Based Learning** (orange button, bottom-right).
-3. Choose the WBL program, formative and summative categories, due date, and Work Event / Transfer max points.
+3. Choose the WBL program, formative/summative/Habits of Work categories, due date, and Work Event / Habits of Work max points.
 4. For Work Events, check off which completed jobs to sync (unsynced ones default to checked; already-synced ones default unchecked so you don't accidentally re-push everyone).
-5. Click **Sync Skills (Formative)**, **Sync Credentials (Summative)**, **Sync Selected Work Events**, or **Sync Transfer Skills** — each runs independently, so you only need to click the ones you want to push this time.
+5. Click **Sync Skills (Formative)**, **Sync Credentials (Summative)**, **Sync Selected Work Events**, or **Sync Habits of Work** — each runs independently, so you only need to click the ones you want to push this time.
 
 On subsequent syncs the extension updates the same PS assignments rather than creating new ones.
 
-### Pulling PS attendance for the Work-Based Learning attendance blend
+### Pulling PS attendance for meeting-day-aware grading and the Work Event blend
 
 1. In the PS gradebook, open the **Attendance Grid** page for each section you want to pull.
    - The extension automatically reads and caches that section's attendance data in the background. A brief toast notification confirms success.
-2. In the DobbsCore teacher portal, navigate to the WBL program's **Roster** tab.
-3. Click **Sync Attendance from PS**.
-   - The extension matches every class linked to that program against its cached PS attendance and bulk-imports the whole cached date range for each — there's no per-date step. Attendance only affects grades through the Work Event blend described above; it plays no part in activity-grade or WBL Skills/Credentials/Transfer scoring.
+2. Click **Sync Attendance from PS** — it appears in two places: the DobbsCore portal's **Classes** list view (pulls for every registered class) and a WBL program's **Roster** tab (pulls only that program's linked classes). Either bulk-imports the whole cached date range per class — there's no per-date step.
+
+Attendance feeds two things once pulled for a class: meeting-day-aware proration of activity grades (see Grade calculation above), and the Work Event Holistic Call blend. It plays no part in Skills/Credentials/Habits of Work scoring.
 
 ---
 
