@@ -202,7 +202,7 @@ async function showCreatePanel(ctx) {
 
     const panel = makePanel('Create DobbsCore Assignment');
     panel.innerHTML += `
-        ${field('Assignment Name', `<input  id="ck-name"     type="text"   value="${defaultName}" ${IS}>`)}
+        ${field('Assignment Name', `<input  id="ck-name"     type="text"   value="${defaultName}" maxlength="${MAX_ASSIGNMENT_NAME_LEN}" ${IS}>`)}
         ${field('Due Date',        `<input  id="ck-due"      type="date"   value="${today}" ${IS}>`)}
         ${field('Max Points',      `<input  id="ck-points"   type="number" value="${defaultPoints}" min="1" ${IS}>`)}
         ${field('Category',        `<select id="ck-category" ${IS}><option value="">Loading…</option></select>`)}
@@ -325,7 +325,10 @@ async function doCreateAndSync(ctx) {
 // Credentials, Work Events, activity grades); Habits of Work is the one
 // caller that passes false — district policy excludes it from the
 // traditional final grade.
+const MAX_ASSIGNMENT_NAME_LEN = 50;
+
 async function psCreateAssignment(name, duedate, dueDateObj, points, sectionsdcid, yearid, teachercategoryid, countedInFinalGrade = true) {
+    name = name.slice(0, MAX_ASSIGNMENT_NAME_LEN);
     const resp = await fetch('/ws/xte/section/assignment', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json;charset=UTF-8' },
