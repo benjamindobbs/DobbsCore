@@ -325,10 +325,31 @@ async function doCreateAndSync(ctx) {
 // Credentials, Work Events, activity grades); Habits of Work is the one
 // caller that passes false — district policy excludes it from the
 // traditional final grade.
+// studentDcids, when a non-empty array, restricts the assignment to just
+// those PS student DCIDs (PS's "assign to specific students" option) via
+// _assignmentstudentassociations. Null/empty means every student in the
+// section, the default for every flow except Work Events.
 const MAX_ASSIGNMENT_NAME_LEN = 50;
 
-async function psCreateAssignment(name, duedate, dueDateObj, points, sectionsdcid, yearid, teachercategoryid, countedInFinalGrade = true) {
+async function psCreateAssignment(name, duedate, dueDateObj, points, sectionsdcid, yearid, teachercategoryid, countedInFinalGrade = true, studentDcids = null) {
     name = name.slice(0, MAX_ASSIGNMENT_NAME_LEN);
+    const section = {
+        description: '', duedate, dueDateObj,
+        extracreditpoints: 0, iscountedinfinalgrade: countedInFinalGrade,
+        isscorespublish: true, isscoringneeded: true, maxretakeallowed: 0,
+        name, pointspossible: points, publishdaysbeforedue: 0,
+        publishonspecificdate: duedate, publishOnSpecificDateObj: dueDateObj,
+        publishoption: 'Immediately', relatedgradescaleitemdcid: null,
+        scoreentrypoints: points, scoretype: 'POINTS', sectionsdcid,
+        selectedOnlineWorkType:  { id: 'Assignment', name: 'Learning Assignment', plugin: 'com.powerschool.lms', disabled: false },
+        selectedPublishOption:   { label: 'Immediately', value: 'Immediately' },
+        selectedScoreType:       { label: 'Points', value: 'POINTS' },
+        totalpointvalue: points, weight: 1, yearid,
+        _assignmentcategoryassociations: [{ teachercategoryid, isprimary: true }],
+        _assignmentstandardassociations: []
+    };
+    if (Array.isArray(studentDcids) && studentDcids.length)
+        section._assignmentstudentassociations = studentDcids.map(d => ({ studentsdcid: Number(d) }));
     const resp = await fetch('/ws/xte/section/assignment', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json;charset=UTF-8' },
@@ -336,21 +357,7 @@ async function psCreateAssignment(name, duedate, dueDateObj, points, sectionsdci
             standardcalcdirection:  'NONE',
             standardscoringmethod:  'GradeScale',
             yearid,
-            _assignmentsections: [{
-                description: '', duedate, dueDateObj,
-                extracreditpoints: 0, iscountedinfinalgrade: countedInFinalGrade,
-                isscorespublish: true, isscoringneeded: true, maxretakeallowed: 0,
-                name, pointspossible: points, publishdaysbeforedue: 0,
-                publishonspecificdate: duedate, publishOnSpecificDateObj: dueDateObj,
-                publishoption: 'Immediately', relatedgradescaleitemdcid: null,
-                scoreentrypoints: points, scoretype: 'POINTS', sectionsdcid,
-                selectedOnlineWorkType:  { id: 'Assignment', name: 'Learning Assignment', plugin: 'com.powerschool.lms', disabled: false },
-                selectedPublishOption:   { label: 'Immediately', value: 'Immediately' },
-                selectedScoreType:       { label: 'Points', value: 'POINTS' },
-                totalpointvalue: points, weight: 1, yearid,
-                _assignmentcategoryassociations: [{ teachercategoryid, isprimary: true }],
-                _assignmentstandardassociations: []
-            }]
+            _assignmentsections: [section]
         })
     });
     if (!resp.ok) {
@@ -362,6 +369,29 @@ async function psCreateAssignment(name, duedate, dueDateObj, points, sectionsdci
     if (!assignmentId || !assignmentsectionid)
         throw new Error('Assignment created but IDs missing from response headers.');
     return { assignmentId, assignmentsectionid };
+}
+
+// Reconciles an existing PS assignment's "assign to specific students" list to
+// exactly `desired` (an array of PS student DCIDs) by round-tripping the whole
+// assignment object through PUT — PS wants the full payload back, not a patch,
+// so `getPayload` must be the object PS returned from
+// GET /ws/xte/section/assignment/{id}. Returns true on success; callers treat
+// false as "leave the assignment alone and warn". An empty current list means
+// the assignment is section-wide today and will be scoped down on success.
+async function psSetAssignmentStudents(assignmentId, getPayload, sectionId, desired) {
+    const sec = getPayload._assignmentsections?.find(s => String(s.sectionsdcid) === String(sectionId));
+    if (!sec) return false;
+    const asid = Array.isArray(sec.assignmentsectionid) ? sec.assignmentsectionid[0] : sec.assignmentsectionid;
+    if (!asid) return false;
+    sec.assignmentsectionid = asid;
+    sec._assignmentstudentassociations =
+        desired.map(d => ({ studentsdcid: Number(d), assignmentsectionid: asid }));
+    const resp = await fetch(`/ws/xte/section/assignment/${assignmentId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json;charset=UTF-8' },
+        body: JSON.stringify(getPayload),
+    });
+    return resp.ok;
 }
 
 // Builds a single PS score entry object.
@@ -629,20 +659,42 @@ async function doWblSync(ctx, classId, kind, f, cache) {
     const dcidMap = {};
     for (const s of await rosterResp.json()) dcidMap[s.studentnumber] = s.dcid;
 
+    const warnings = [];
+
     // Verifies a stored PS assignment id before reusing it — the teacher may
     // have deleted the assignment since the last sync.
-    const resolveAssignment = async (existing, name, maxPts, categoryid) => {
+    // studentDcids (Work Events only) is the exact set of students the PS
+    // assignment should carry. On create it's passed straight through; on
+    // reuse the existing assignment's list is reconciled to match it (adds
+    // late participants, drops students no longer scored — for Work Events the
+    // participant set is the source of truth and non-participants never had a
+    // score to lose). A failed reconcile falls back to a warning.
+    const resolveAssignment = async (existing, name, maxPts, categoryid, studentDcids = null) => {
         if (existing?.ps_assignment_id) {
             const r = await fetch(`/ws/xte/section/assignment/${existing.ps_assignment_id}`);
             if (r.ok) {
                 const d = await r.json();
                 const sec = d._assignmentsections?.find(s => String(s.sectionsdcid) === String(ctx.sectionId));
                 const asid = Array.isArray(sec?.assignmentsectionid) ? sec.assignmentsectionid[0] : sec?.assignmentsectionid;
-                if (asid) return { assignmentId: existing.ps_assignment_id, assignmentsectionid: asid };
+                if (asid) {
+                    if (Array.isArray(studentDcids) && studentDcids.length) {
+                        const have = new Set((sec._assignmentstudentassociations || []).map(a => String(a.studentsdcid)));
+                        const want = studentDcids.map(String);
+                        const differs = have.size !== want.length || want.some(x => !have.has(x));
+                        if (differs) {
+                            let ok = false;
+                            try { ok = await psSetAssignmentStudents(existing.ps_assignment_id, d, ctx.sectionId, studentDcids); }
+                            catch { ok = false; }
+                            if (!ok)
+                                warnings.push(`"${name}": couldn't update the participant list on the existing PS assignment — adjust it in PowerSchool by hand, or delete it so the next sync rebuilds it.`);
+                        }
+                    }
+                    return { assignmentId: existing.ps_assignment_id, assignmentsectionid: asid };
+                }
             }
         }
         return psCreateAssignment(name, f.duedate, dueDateObj, maxPts, Number(ctx.sectionId), yearid,
-                                  categoryid || f.teachercategoryid);
+                                  categoryid || f.teachercategoryid, true, studentDcids);
     };
 
     // Skills and credentials are completion grades, not partial mastery.
@@ -736,14 +788,20 @@ async function doWblSync(ctx, classId, kind, f, cache) {
         const picked = new Set([...document.querySelectorAll('.ck-wbl-job:checked')].map(i => Number(i.value)));
         const jobs = block.work_events.filter(w => w.sync_enabled && picked.has(w.work_event_id));
         if (!jobs.length) throw new Error('Select at least one completed work event.');
-        let done = 0, unmatched = [];
+        let done = 0, unmatched = [], synced = 0;
         for (const w of jobs) {
             setStatus(`Syncing “${w.title}” (${++done}/${jobs.length})…`);
-            const { assignmentId, assignmentsectionid } =
-                await resolveAssignment(w, `${block.program.name}: ${w.title}`, f.wePts, f.summcategoryid);
             const calls = Object.fromEntries(w.calls.map(c => [c.student_id, c]));
-            // Only participants with a Holistic Call are scored — a student who
-            // wasn't on the job gets no mark rather than a zero.
+            // The assignment is scoped to exactly the participants with a
+            // Holistic Call — everyone else is left off the PS assignment
+            // entirely rather than sitting on it blank.
+            const callDcids = w.calls.map(c => dcidMap[c.student_id]).filter(Boolean);
+            if (!callDcids.length) {
+                warnings.push(`"${w.title}": no scored participant matched the PS roster — skipped.`);
+                continue;
+            }
+            const { assignmentId, assignmentsectionid } =
+                await resolveAssignment(w, `${block.program.name}: ${w.title}`, f.wePts, f.summcategoryid, callDcids);
             const res = await submitFor(assignmentId, assignmentsectionid, sid => {
                 const c = calls[sid];
                 if (!c) return null;
@@ -751,13 +809,14 @@ async function doWblSync(ctx, classId, kind, f, cache) {
                 return round2((pct / 100) * f.wePts);
             });
             unmatched = res.unmatched;
+            synced++;
             idsBack.work_events.push({
                 work_event_id: w.work_event_id,
                 ps_assignment_id: String(assignmentId),
                 ps_assignmentsection_id: String(assignmentsectionid),
             });
         }
-        summary = `✓ ${jobs.length} work event assignment(s) scored.`;
+        summary = `✓ ${synced} work event assignment(s) scored.`;
         if (unmatched.length) summary += ` ${unmatched.length} unmatched.`;
     }
 
@@ -769,7 +828,12 @@ async function doWblSync(ctx, classId, kind, f, cache) {
         token: teacherToken,
         body: idsBack,
     });
-    setStatus(summary, '#16a34a');
+    if (warnings.length) {
+        summary += `  ⚠ ${warnings.join('  ')}`;
+        setStatus(summary, '#b45309');
+    } else {
+        setStatus(summary, '#16a34a');
+    }
 }
 
 // Habits of Work: all 5 soft skills (3 dispositional + 2 transfer) in one
