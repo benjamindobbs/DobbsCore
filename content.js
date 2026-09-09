@@ -4,6 +4,7 @@ const BTN_ID        = 'ck-sync-btn';
 const IMPORT_BTN_ID = 'ck-import-btn';
 const RESYNC_BTN_ID = 'ck-resync-btn';
 const WBL_BTN_ID    = 'ck-wbl-btn';
+const HOW_BTN_ID    = 'ck-how-btn';
 const PANEL_ID      = 'ck-sync-panel';
 
 // ── URL parsing ───────────────────────────────────────────────────────────────
@@ -30,6 +31,7 @@ function removeUI() {
     document.getElementById(IMPORT_BTN_ID)?.remove();
     document.getElementById(RESYNC_BTN_ID)?.remove();
     document.getElementById(WBL_BTN_ID)?.remove();
+    document.getElementById(HOW_BTN_ID)?.remove();
     document.getElementById(PANEL_ID)?.remove();
 }
 
@@ -86,6 +88,11 @@ async function checkAndInjectClassBtn(ctx) {
     if (wblResp.ok && wblResp.data?.programs?.length) {
         makeBtn(WBL_BTN_ID, 'Sync Work-Based Learning', '72px', '#c2410c',
             () => showWblSyncPanel(ctx, matchedClass.id, wblResp.data.programs.map(p => p.program)));
+    } else if (wblResp.ok) {
+        // Definitely not a WBL class — offer the Habits of Work (Do Now / Exit
+        // Slip) sync instead. Same 72px slot; the two are mutually exclusive.
+        makeBtn(HOW_BTN_ID, 'Sync Habits of Work', '72px', '#7c3aed',
+            () => showHowSyncPanel(ctx, matchedClass.id));
     }
 
     // Re-pull the PS roster and reconcile adds/withdrawals against DobbsCore.
@@ -924,6 +931,163 @@ async function doHabitsSync(ctx, classId, f) {
 
     let summary = `✓ ${block.habits.length} Habits of Work assignment(s). ${scored} score(s) submitted.`;
     if (unmatched.length) summary += ` ${unmatched.length} unmatched.`;
+    setStatus(summary, '#16a34a');
+}
+
+// ── Habits of Work sync panel (non-WBL classes) ──────────────────────────────
+//
+// The standalone Do Now / Exit Slip flow for classes not in a WBL program.
+// One click creates/updates 6 PS assignments — 3 categories × { weekly, standing } —
+// all with iscountedinfinalgrade: false, matching the WBL Habits of Work policy.
+// The server (GET /api/how/sync) does all the aggregation; this just resolves
+// PS assignments and posts point values. Cadence-agnostic: a class set to
+// 'weekly' (one Do Now a week, a goal per category) produces the exact same
+// payload shape as a 'daily' one, so nothing here needs to branch on it.
+
+function showHowSyncPanel(ctx, classId) {
+    const today = new Date().toISOString().slice(0, 10);
+    const panel = makePanel('Sync Habits of Work');
+    panel.innerHTML += `
+        ${field('Category', `<select id="ck-category" ${IS}><option value="">Loading…</option></select>`)}
+        <div id="ck-period-row" style="display:none;margin-bottom:10px">
+            <span style="font-size:11px;color:#64748b;font-weight:500;text-transform:uppercase;letter-spacing:.04em">Marking Period</span>
+            <span id="ck-period" style="display:block;font-size:13px;margin-top:3px"></span>
+        </div>
+        ${field('Week (any date in it)', `<input id="ck-how-week" type="date" value="${today}" ${IS}>`)}
+        ${field('Due Date',              `<input id="ck-due"      type="date" value="${today}" ${IS}>`)}
+        ${field('Max Points',            `<input id="ck-how-points" type="number" value="10" min="0.01" step="0.01" ${IS}>`)}
+        <p style="font-size:11px;color:#94a3b8;margin:-2px 0 10px;line-height:1.45">
+            Creates 3 weekly assignments (that week's category average) and 3 standing
+            assignments (mean of the last 3 weekly averages), all excluded from the final grade.
+            Works the same whether the class runs its Do Now daily or weekly.
+        </p>
+        <div id="ck-status" style="font-size:12px;color:#64748b;margin-bottom:12px;min-height:32px;line-height:1.4"></div>
+        <button id="ck-how-run" style="width:100%;padding:9px;background:#7c3aed;color:#fff;border:none;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer">Sync Habits of Work</button>
+    `;
+    document.getElementById('ck-close').onclick = () => { removeUI(); injectButton(ctx); };
+    loadCategories(ctx.sectionId);
+
+    (async () => {
+        const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
+        const gs = await chrome.runtime.sendMessage({
+            type: 'KENKEN_FETCH', url: `${serverUrl}/api/teacher/gradebook-settings`, token: teacherToken
+        });
+        if (gs.ok && gs.data?.wbl_transfer_max_score != null) {
+            const el = document.getElementById('ck-how-points');
+            if (el) el.value = gs.data.wbl_transfer_max_score;
+        }
+    })();
+
+    const readForm = () => {
+        const catSel = document.getElementById('ck-category');
+        const f = {
+            week:      document.getElementById('ck-how-week')?.value,
+            duedate:   document.getElementById('ck-due')?.value,
+            hwPts:     parseFloat(document.getElementById('ck-how-points')?.value),
+            teachercategoryid: Number(catSel?.value),
+            termid:    Number(catSel?.dataset.termid),
+            storecode: catSel?.dataset.storecode,
+        };
+        if (!f.week)              { setStatus('Pick a week.', '#dc2626'); return null; }
+        if (!f.duedate)           { setStatus('Select a due date.', '#dc2626'); return null; }
+        if (isNaN(f.hwPts) || f.hwPts <= 0) { setStatus('Enter valid max points.', '#dc2626'); return null; }
+        if (!f.teachercategoryid) { setStatus('Select a category.', '#dc2626'); return null; }
+        if (!f.termid)            { setStatus('Category data not loaded yet.', '#dc2626'); return null; }
+        if (!f.storecode)         { setStatus('No active marking period found.', '#dc2626'); return null; }
+        return f;
+    };
+
+    document.getElementById('ck-how-run').onclick = async () => {
+        const f = readForm();
+        if (!f) return;
+        const btn = document.getElementById('ck-how-run');
+        btn.disabled = true; btn.style.opacity = '0.6';
+        try {
+            await doHowSync(ctx, classId, f);
+        } catch (err) {
+            setStatus('Error: ' + err.message, '#dc2626');
+            console.error('[DobbsCore HoW sync]', err);
+        } finally {
+            btn.disabled = false; btn.style.opacity = '';
+        }
+    };
+}
+
+async function doHowSync(ctx, classId, f) {
+    const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
+    const yearid     = Math.floor(f.termid / 100);
+    const dueDateObj = new Date(f.duedate + 'T12:00:00').toISOString();
+
+    setStatus('Fetching Habits of Work aggregates…');
+    const resp = await chrome.runtime.sendMessage({
+        type: 'KENKEN_FETCH',
+        url:  `${serverUrl}/api/how/sync?class_id=${classId}&week=${f.week}`,
+        token: teacherToken
+    });
+    if (!resp.ok) throw new Error('Failed to fetch Habits of Work aggregates.');
+    const data = resp.data;
+    if (!data.categories?.length) throw new Error('Nothing to sync.');
+
+    setStatus('Fetching class roster…');
+    const rosterResp = await fetch(`/ws/xte/student?section_ids=${ctx.sectionId}&status=A,P`);
+    if (!rosterResp.ok) throw new Error(`Roster fetch failed (${rosterResp.status})`);
+    const dcidMap = {};
+    for (const s of await rosterResp.json()) dcidMap[s.studentnumber] = s.dcid;
+
+    const resolveAssignment = async (existing, name) => {
+        if (existing?.ps_assignment_id) {
+            const r = await fetch(`/ws/xte/section/assignment/${existing.ps_assignment_id}`);
+            if (r.ok) {
+                const d = await r.json();
+                const sec = d._assignmentsections?.find(s => String(s.sectionsdcid) === String(ctx.sectionId));
+                const asid = Array.isArray(sec?.assignmentsectionid) ? sec.assignmentsectionid[0] : sec?.assignmentsectionid;
+                if (asid) return { assignmentId: existing.ps_assignment_id, assignmentsectionid: asid };
+            }
+        }
+        return psCreateAssignment(name, f.duedate, dueDateObj, f.hwPts, Number(ctx.sectionId), yearid,
+                                  f.teachercategoryid, false);
+    };
+
+    const round2 = n => Math.round(n * 100) / 100;
+    const assignmentsBack = [];
+    let created = 0, scored = 0, unmatched = new Set();
+
+    for (const cat of data.categories) {
+        for (const kind of ['weekly', 'standing']) {
+            const block = cat[kind];
+            const label = kind === 'weekly' ? 'Weekly' : 'Standing';
+            const name  = `HoW ${cat.name} — ${label}`;
+            setStatus(`Syncing ${name}…`);
+            const { assignmentId, assignmentsectionid } = await resolveAssignment(block, name);
+            if (!block.ps_assignment_id) created++;
+
+            const scores = [];
+            for (const row of block.scores || []) {
+                const dcid = dcidMap[row.student_id];
+                if (!dcid) { unmatched.add(row.student_id); continue; }
+                const pointValue = round2((row.score / 100) * f.hwPts);
+                scores.push(psScoreEntry(dcid, pointValue, assignmentsectionid, assignmentId, ctx.sectionId));
+            }
+            if (scores.length) { await psSubmitScores(scores); scored += scores.length; }
+
+            assignmentsBack.push({
+                category: cat.category,
+                kind,
+                ps_assignment_id: String(assignmentId),
+                ps_assignmentsection_id: String(assignmentsectionid),
+            });
+        }
+    }
+
+    await chrome.runtime.sendMessage({
+        type: 'KENKEN_FETCH', method: 'POST',
+        url:  `${serverUrl}/api/how/sync/ids`,
+        token: teacherToken,
+        body: { class_id: classId, assignments: assignmentsBack },
+    });
+
+    let summary = `✓ ${assignmentsBack.length} assignment(s) (${created} new). ${scored} score(s) submitted for ${data.week} (${data.cadence} class).`;
+    if (unmatched.size) summary += ` ${unmatched.size} unmatched.`;
     setStatus(summary, '#16a34a');
 }
 

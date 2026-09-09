@@ -39,6 +39,14 @@ QC Spot Checks and the dispositional Do Now / Exit Slip submissions themselves a
 
 Every Habits of Work assignment is created with **"Count in Traditional Final Grade" off** (district policy for this category) and defaults to the Formative category via its own selector in the panel — repoint that once the district adds a dedicated category.
 
+**Sync Habits of Work (non-WBL classes)** — appears on a PS class page for a registered section that is **not** linked to a WBL program (it takes the same button slot the WBL sync would occupy). These classes run the district Habits of Work Do Now / Exit Slip flow, on a per-class **cadence** the teacher picks in the DobbsCore portal's per-class **Habits of Work** panel:
+
+- *Daily* — one Do Now a day; the student picks one goal under **Dignitas**, **Pietas**, or **Gravitas**, writes an exit slip, and the teacher rates that one category 1–4.
+- *Weekly* — one Do Now a week; the student picks one goal in **each** of the 3 categories, writes one exit slip covering all 3, and the teacher rates all 3 from a single review card.
+- *Weekly + daily evidence log* (an option on Weekly) — same as Weekly, but the student adds short dated evidence notes per category through the week; those roll up into the one end-of-week review card the teacher rates. The evidence notes themselves never sync — only the teacher's 3 ratings do.
+
+Either way, one click here creates/updates **6 assignments** for the picked week: per category, a *Weekly* assignment (that week's mean teacher rating × 25) and a *Standing* assignment (mean of the last ≤3 weekly aggregates, up to and including the picked week). All 6 are created with **"Count in Traditional Final Grade" off**; the week and max points are set in the panel, and the server does all the aggregation (`GET /api/how/sync`) — the payload shape is identical for both cadences, so the button behaves the same.
+
 **Sync Attendance from PS** — a button that appears in two places: the DobbsCore portal's WBL **Roster** tab (pulls only that program's linked classes, as before) and the **Classes** list view (pulls for every registered class, WBL-linked or not — meeting-day-aware activity-grade proration, below, benefits from attendance regardless of whether a class has any WBL program attached). Two-step flow either way:
 
 1. Open the PS **Attendance Grid** page for a section. The extension automatically reads the grid's embedded attendance data and caches it in browser storage (a toast confirms how many students/dates were captured).
@@ -75,6 +83,13 @@ That proration is **school-day-aware, not just calendar-day**, whenever PS atten
   - The average of everything that counted is the score. A student with zero countable days that period is left blank.
 
 Default max-points values for all flows are pre-filled from the teacher's DobbsCore gradebook settings; Habits of Work's max points is the same setting Transfer used to use alone, now shared across all 5.
+
+**Habits of Work scores (non-WBL classes)**, computed server-side (`GET /api/how/sync`), per Dignitas / Pietas / Gravitas category:
+
+- *Weekly*: the mean of the teacher's 1–4 exit-slip ratings for that category in the picked ISO week (Mon–Sun), **× 25** (0/25/50/75/100). In a *daily* class that's the average of every rated day that week; in a *weekly* class it's the single weekly rating. Exit slips with no teacher rating, and voided slips, don't count; missing days/weeks are not zero-filled. A student with no rated slip that week is left blank.
+- *Standing*: the mean of that student's weekly aggregates for the last ≤3 weeks (that have data) up to and including the picked week — so re-syncing an earlier week reproduces its history.
+
+Point values are `score / 100 × max points`. Students are matched by 6-digit PS Student Number, same as every other flow.
 
 ---
 
