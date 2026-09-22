@@ -740,7 +740,7 @@ async function doWblSync(ctx, classId, kind, f, cache) {
             for (const sk of c.skills.filter(x => x.state !== 'not_started')) {
                 setStatus(`Syncing “${sk.name}” (${++done}/${total})…`);
                 const { assignmentId, assignmentsectionid } = await resolveAssignment(
-                    sk, `${block.program.name}: ${c.name} — ${sk.name}`, COMPLETION, f.teachercategoryid);
+                    sk, `${c.name} — ${sk.name}`, COMPLETION, f.teachercategoryid);
                 const met = new Set(sk.satisfied);
                 const res = await submitFor(assignmentId, assignmentsectionid, sid => {
                     if (met.has(sid)) return COMPLETION;
@@ -769,7 +769,7 @@ async function doWblSync(ctx, classId, kind, f, cache) {
         for (const c of creds) {
             setStatus(`Syncing “${c.name}” (${++done}/${creds.length})…`);
             const { assignmentId, assignmentsectionid } = await resolveAssignment(
-                c, `${block.program.name}: ${c.name}`, COMPLETION, f.summcategoryid);
+                c, c.name, COMPLETION, f.summcategoryid);
             const prior = new Set(c.earned_prior);
             const here  = new Set(c.earned);
             const res = await submitFor(assignmentId, assignmentsectionid, sid => {
@@ -808,7 +808,7 @@ async function doWblSync(ctx, classId, kind, f, cache) {
                 continue;
             }
             const { assignmentId, assignmentsectionid } =
-                await resolveAssignment(w, `${block.program.name}: ${w.title}`, f.wePts, f.summcategoryid, callDcids);
+                await resolveAssignment(w, w.title, f.wePts, f.summcategoryid, callDcids);
             const res = await submitFor(assignmentId, assignmentsectionid, sid => {
                 const c = calls[sid];
                 if (!c) return null;
@@ -897,7 +897,7 @@ async function doHabitsSync(ctx, classId, f) {
     let done = 0, unmatched = [], scored = 0;
     for (const h of block.habits) {
         setStatus(`Syncing “${h.name}” (${++done}/${block.habits.length})…`);
-        const { assignmentId, assignmentsectionid } = await resolveAssignment(h, `${block.program.name}: ${h.name}`);
+        const { assignmentId, assignmentsectionid } = await resolveAssignment(h, h.name);
         const byStudent = Object.fromEntries(h.scores.map(s => [s.student_id, s]));
         const scores = [], localUnmatched = [];
         for (const sid of Object.keys(byStudent)) {
