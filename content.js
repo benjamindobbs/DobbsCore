@@ -184,6 +184,11 @@ async function doSync(ctx) {
     const btn = document.getElementById('ck-sync');
     btn.disabled = true; btn.textContent = 'Syncing…';
     try {
+        if (!await confirmAttendanceCoverage(classId, start, end, serverUrl, teacherToken)) {
+            setStatus('Cancelled — sync attendance first (DobbsCore → Classes → Sync Attendance from PS).', '#d97706');
+            btn.disabled = false; btn.textContent = 'Sync Grades';
+            return;
+        }
         await submitScores(ctx.sectionId, ctx.assignmentId, classId, start, end, serverUrl, teacherToken);
     } catch (err) {
         setStatus(`Error: ${err.message}`, '#dc2626');
@@ -303,6 +308,12 @@ async function doCreateAndSync(ctx) {
     btn.disabled = true; btn.textContent = 'Creating…';
 
     try {
+        // Before creating anything in PS — a cancel here leaves no stray assignment.
+        if (!await confirmAttendanceCoverage(classId, start, end, serverUrl, teacherToken)) {
+            setStatus('Cancelled — sync attendance first (DobbsCore → Classes → Sync Attendance from PS).', '#d97706');
+            btn.disabled = false; btn.textContent = 'Create & Sync';
+            return;
+        }
         const yearid     = Math.floor(termid / 100);
         const dueDateObj = new Date(duedate + 'T12:00:00').toISOString();
 
@@ -1093,6 +1104,30 @@ async function doHowSync(ctx, classId, f) {
 
 // ── Shared score submission ───────────────────────────────────────────────────
 
+// Pre-sync check for Daily Practice grades: DobbsCore only knows which days a
+// class met from synced PS attendance. Without it, every calendar day in the
+// range is graded (students lose credit for weekends/days off); with a gap at
+// either end, work on those days doesn't count. Warns with a confirm() popup;
+// returns true to continue. A failed check (old server, network) doesn't block.
+async function confirmAttendanceCoverage(classId, start, end, serverUrl, teacherToken) {
+    setStatus('Checking attendance sync…');
+    const resp = await chrome.runtime.sendMessage({
+        type: 'KENKEN_FETCH',
+        url: `${serverUrl}/api/teacher/classes/${classId}/attendance-coverage?start=${start}&end=${end}`,
+        token: teacherToken
+    });
+    if (!resp.ok || !resp.data?.warning) return true;
+    const last = resp.data.last_synced_at
+        ? `\nLast attendance sync for this class: ${new Date(resp.data.last_synced_at).toLocaleString()}.`
+        : '\nAttendance has never been synced for this class.';
+    return confirm(
+        `⚠ DobbsCore attendance warning\n\n${resp.data.warning}${last}\n\n`
+        + 'To fix: open this class\'s PowerSchool attendance page (so the extension caches it), then in DobbsCore '
+        + 'go to Classes → "Sync Attendance from PS (all classes)".\n\n'
+        + 'Press OK to sync grades anyway, or Cancel to stop.'
+    );
+}
+
 async function submitScores(sectionId, assignmentId, classId, start, end, serverUrl, teacherToken, preloaded = null) {
     setStatus('Fetching class roster…');
     const rosterResp = await fetch(`/ws/xte/student?section_ids=${sectionId}&status=A,P`);
@@ -1325,17 +1360,19 @@ if (window.location.hostname.includes('powerschool.com')) {
         captureAttendanceFromPage();
     }
 } else {
-    // On DobbsCore portal: watch for either anchor and inject the sync button
-    const ATTENDANCE_ANCHOR_IDS = ['wbl-attendance-sync', 'classes-attendance-sync'];
+    // On DobbsCore portal: inject a sync button into EVERY anchor present.
+    // The portal hides inactive tabs with display:none rather than unmounting
+    // them, so both anchors are always in the DOM — a single global button
+    // used to always land in the WBL anchor (first in the list) and the
+    // Classes-tab button never appeared, leaving non-WBL classes unsynced.
+    // Each button carries its own scope: 'wbl' = the selected program's
+    // linked classes, 'all' = every registered class.
+    const ATTENDANCE_ANCHORS = { 'wbl-attendance-sync': 'wbl', 'classes-attendance-sync': 'all' };
     const attObserver = new MutationObserver(() => {
-        // Global existence check, not per-anchor: the two anchors live in
-        // mutually exclusive SPA views, so only one is ever mounted at a
-        // time — and the button's id must stay unique on the page since
-        // doPullAttendance looks it up by that id.
-        if (document.getElementById('ck-pull-att-btn')) return;
-        for (const id of ATTENDANCE_ANCHOR_IDS) {
+        for (const [id, scope] of Object.entries(ATTENDANCE_ANCHORS)) {
             const actionsEl = document.getElementById(id);
-            if (actionsEl) { injectPullAttendanceButton(actionsEl); break; }
+            if (actionsEl && !actionsEl.querySelector('.ck-pull-att-btn'))
+                injectPullAttendanceButton(actionsEl, scope);
         }
     });
     attObserver.observe(document.body, { childList: true, subtree: true });
@@ -1385,10 +1422,10 @@ function captureAttendanceFromPage() {
     });
 }
 
-function injectPullAttendanceButton(actionsEl) {
+function injectPullAttendanceButton(actionsEl, scope) {
     const btn = document.createElement('button');
-    btn.id        = 'ck-pull-att-btn';
-    btn.textContent = '⟳ Sync Attendance from PS';
+    btn.className = 'ck-pull-att-btn';
+    btn.textContent = scope === 'all' ? '⟳ Sync Attendance from PS (all classes)' : '⟳ Sync Attendance from PS';
     Object.assign(btn.style, {
         padding: '0.5rem 1rem', background: '#0891b2', color: '#fff',
         border: 'none', borderRadius: '6px', fontSize: '0.875rem',
@@ -1396,11 +1433,10 @@ function injectPullAttendanceButton(actionsEl) {
     });
     btn.onmouseenter = () => { btn.style.filter = 'brightness(0.9)'; };
     btn.onmouseleave = () => { btn.style.filter = ''; };
-    btn.onclick = doPullAttendance;
-
     const statusSpan = document.createElement('span');
-    statusSpan.id = 'ck-pull-att-status';
+    statusSpan.className = 'ck-pull-att-status';
     Object.assign(statusSpan.style, { fontSize: '0.8125rem', marginLeft: '0.5rem', color: '#64748b' });
+    btn.onclick = () => doPullAttendance(scope, btn, statusSpan);
 
     actionsEl.appendChild(btn);
     actionsEl.appendChild(statusSpan);
@@ -1425,20 +1461,23 @@ function mdToIso(md) {
 // step. Trusts PS as the source of truth; the only manual override is the
 // "Called Out" button on the roster itself.
 //
-// Two entry points, same underlying loop: from the WBL Roster tab (a
-// #wbl-program-select is present) this pulls only that program's linked
-// classes, exactly as before; from the Classes list view (no such selector)
-// it pulls every registered class, WBL-linked or not, since meeting-day-aware
-// activity-grade proration (server/routes/teacher.js) benefits from
+// Two entry points, same underlying loop, chosen by `scope` (which button was
+// clicked — NOT by whether #wbl-program-select exists, since hidden tabs stay
+// in the DOM): 'wbl' pulls only the selected program's linked classes; 'all'
+// (Classes tab) pulls every registered class, WBL-linked or not, since
+// meeting-day-aware Daily Practice grading (server/routes/teacher.js) needs
 // attendance regardless of whether a class has any WBL program attached.
-async function doPullAttendance() {
-    const btn      = document.getElementById('ck-pull-att-btn');
-    const statusEl = document.getElementById('ck-pull-att-status');
+//
+// Every class that couldn't be synced is reported in the final status (and a
+// popup), instead of being overwritten by the last "Synced N records" line.
+async function doPullAttendance(scope, btn, statusEl) {
     const setPS = (msg, color = '#64748b') => {
         if (statusEl) { statusEl.textContent = msg; statusEl.style.color = color; }
     };
 
-    const programId = document.getElementById('wbl-program-select')?.value;
+    const programId = scope === 'wbl' ? document.getElementById('wbl-program-select')?.value : null;
+    if (scope === 'wbl' && !programId) { setPS('Select a WBL program first.', '#dc2626'); return; }
+    const idleLabel = btn.textContent;
 
     btn.disabled = true; btn.textContent = 'Syncing...'; setPS('');
 
@@ -1472,40 +1511,54 @@ async function doPullAttendance() {
 
         const allCached = await chrome.storage.local.get(null);
         let totalImported = 0, totalUnmatched = 0, classesSynced = 0;
+        const problems = [];   // "Class name: what went wrong" — reported at the end
+        const synced   = [];   // "Class name: M/D–M/D"
 
         for (const cls of targetClasses) {
             const psSectionId = sectionByClassId[cls.id];
-            if (!psSectionId) continue;   // no PS section linked to this class
+            if (!psSectionId) { problems.push(`${cls.name}: no PowerSchool section linked (re-import the roster from PS)`); continue; }
 
             setPS(`Matching ${cls.name}...`);
 
             // Same section-id-mismatch fallback the old single-date pull used:
             // PS uses different sectionId values in gradebook vs attendance
             // URLs, so verify by student DCID overlap rather than trusting
-            // the cache key alone.
+            // the cache key alone. Picks the cache with the HIGHEST overlap
+            // (at least half the class) — "any shared student" used to grab
+            // another section's grid whenever a student was in both.
             let cache = allCached[`att_${psSectionId}`];
             if (!cache) {
                 const classResp = await chrome.runtime.sendMessage({
                     type: 'KENKEN_FETCH', url: `${serverUrl}/api/teacher/classes/${cls.id}`, token: teacherToken
                 });
                 if (classResp.ok) {
-                    const knownDcids = new Set(classResp.data.students.map(s => String(s.ps_dcid)).filter(Boolean));
-                    const match = Object.entries(allCached)
-                        .filter(([k]) => k.startsWith('att_'))
-                        .sort((a, b) => (b[1].cachedAt ?? 0) - (a[1].cachedAt ?? 0))
-                        .find(([, v]) => (v.studentIds?.[0] ?? []).some(id => knownDcids.has(String(id))));
-                    if (match) cache = match[1];
+                    const knownDcids = new Set(classResp.data.students
+                        .filter(s => !s.exited_on && s.ps_dcid).map(s => String(s.ps_dcid)));
+                    let best = null, bestScore = 0;
+                    for (const [k, v] of Object.entries(allCached)) {
+                        if (!k.startsWith('att_')) continue;
+                        const ids = v.studentIds?.[0] ?? [];
+                        const hits = ids.filter(id => knownDcids.has(String(id))).length;
+                        const score = knownDcids.size ? hits / knownDcids.size : 0;
+                        if (score > bestScore || (score === bestScore && best && (v.cachedAt ?? 0) > (best.cachedAt ?? 0))) {
+                            best = v; bestScore = score;
+                        }
+                    }
+                    if (best && bestScore >= 0.5) cache = best;
                 }
             }
             if (!cache) {
-                setPS(`No cached attendance for ${cls.name} — open the PS attendance page for it first.`, '#dc2626');
+                problems.push(`${cls.name}: no cached attendance — open this class's PS attendance page, then sync again`);
                 continue;
             }
 
             const studentDcids = cache.studentIds?.[0];
             const dates        = cache.dates?.[0];
             const attData      = cache.attData?.[0];
-            if (!studentDcids || !dates || !attData) continue;
+            if (!studentDcids || !dates || !attData || !dates.length) {
+                problems.push(`${cls.name}: cached attendance is empty — reopen its PS attendance page`);
+                continue;
+            }
 
             // dates (sec_att_date_arr) is already meeting-days-only — a date
             // absent from it never appears here, so there's nothing to filter.
@@ -1524,26 +1577,41 @@ async function doPullAttendance() {
                 token: teacherToken, body: { rows },
             });
             if (importResp.ok) {
-                totalImported += importResp.data.imported;
-                totalUnmatched += importResp.data.unmatched.length;
-                classesSynced++;
+                const { imported, unmatched } = importResp.data;
+                totalImported += imported;
+                totalUnmatched += unmatched.length;
+                if (imported === 0) {
+                    // A 200 with nothing stored — every student's ps_dcid was unknown.
+                    problems.push(`${cls.name}: 0 records stored — no students matched by PS ID (re-sync the roster from PS)`);
+                } else {
+                    classesSynced++;
+                    synced.push(`${cls.name}: ${dates[0]}–${dates[dates.length - 1]}`);
+                    if (unmatched.length)
+                        problems.push(`${cls.name}: ${unmatched.length} student(s) not matched by PS ID`);
+                }
             } else {
+                problems.push(`${cls.name}: server error (${importResp.error || importResp.status})`);
                 console.error('[Sync Attendance]', cls.name, importResp.error || importResp.status);
             }
         }
 
-        setPS(
-            classesSynced > 0
-                ? `Synced ${totalImported} record${totalImported !== 1 ? 's' : ''} across ${classesSynced} class${classesSynced !== 1 ? 'es' : ''}`
-                  + (totalUnmatched ? `, ${totalUnmatched} unmatched (no ps_dcid on record).` : '.')
-                : 'Nothing synced — open the PS attendance page for a linked class first.',
-            classesSynced > 0 ? '#16a34a' : '#dc2626'
-        );
+        const summary = classesSynced > 0
+            ? `Synced ${totalImported} record${totalImported !== 1 ? 's' : ''} across ${classesSynced} class${classesSynced !== 1 ? 'es' : ''}.`
+            : 'Nothing synced.';
+        setPS(problems.length ? `${summary} ${problems.length} problem(s) — see popup.` : summary,
+              problems.length ? '#d97706' : '#16a34a');
+        if (statusEl) statusEl.title = [...synced, ...problems].join('\n');
+        if (problems.length) {
+            alert(`Attendance sync: ${summary}\n\n`
+                + (synced.length ? `Synced (dates covered):\n  ${synced.join('\n  ')}\n\n` : '')
+                + `Not synced / issues:\n  ${problems.join('\n  ')}\n\n`
+                + 'Classes without attendance get graded on EVERY calendar day, including days class did not meet.');
+        }
     } catch (err) {
         setPS(`Error: ${err.message}`, '#dc2626');
         console.error('[Sync Attendance]', err);
     } finally {
-        btn.disabled = false; btn.textContent = '⟳ Sync Attendance from PS';
+        btn.disabled = false; btn.textContent = idleLabel;
     }
 }
 
