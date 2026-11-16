@@ -136,7 +136,8 @@ function setStatus(msg, color = '#64748b') {
 
 // ── KenKen class list (shared) ────────────────────────────────────────────────
 
-async function populateClasses(selectId) {
+// Preselects the DobbsCore class registered to the open PS section, if any.
+async function populateClasses(selectId, sectionId) {
     const sel = document.getElementById(selectId);
     if (!sel) return;
     const { serverUrl, teacherToken } = await chrome.storage.sync.get(['serverUrl', 'teacherToken']);
@@ -152,6 +153,8 @@ async function populateClasses(selectId) {
         return;
     }
     sel.innerHTML = resp.data.map(c => `<option value="${c.id}">${c.name}</option>`).join('');
+    const match = sectionId && resp.data.find(c => String(c.ps_section_id) === String(sectionId));
+    if (match) sel.value = String(match.id);
 }
 
 // ── Score-only panel (existing assignment) ────────────────────────────────────
@@ -167,7 +170,7 @@ function showSyncPanel(ctx) {
     `;
     document.getElementById('ck-close').onclick = () => { removeUI(); injectButton(ctx); };
     document.getElementById('ck-sync').onclick  = () => doSync(ctx);
-    populateClasses('ck-class');
+    populateClasses('ck-class', ctx.sectionId);
 }
 
 async function doSync(ctx) {
@@ -231,7 +234,7 @@ async function showCreatePanel(ctx) {
     `;
     document.getElementById('ck-close').onclick  = () => { removeUI(); injectButton(ctx); };
     document.getElementById('ck-create').onclick = () => doCreateAndSync(ctx);
-    populateClasses('ck-class');
+    populateClasses('ck-class', ctx.sectionId);
     loadCategories(ctx.sectionId);
 }
 

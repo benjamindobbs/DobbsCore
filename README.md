@@ -148,7 +148,7 @@ The panel reports what changed — students added, reactivated, or withdrawn, pl
 1. Navigate to the same class page in PS.
 2. Click **Create DobbsCore Assignment** (blue button, bottom-right).
 3. Fill in the assignment name, due date, max points, and category. The **Formative** category and your configured max score are selected by default.
-4. Choose the DobbsCore class and the date range covering the activity window you want to grade.
+4. Confirm the DobbsCore class (preselected to the class registered to this PS section) and choose the date range covering the activity window you want to grade.
 5. Click **Create & Sync**.
 
 The extension will create the PS assignment, fetch DobbsCore grades, and submit scores in one operation.
@@ -157,7 +157,7 @@ The extension will create the PS assignment, fetch DobbsCore grades, and submit 
 
 1. Open the score-entry page for an existing PS assignment (`score_assignment?...`).
 2. Click **Sync DobbsCore Grades** (blue button, bottom-right).
-3. Select the DobbsCore class and date range.
+3. Confirm the DobbsCore class (preselected when this PS section is registered) and select the date range.
 4. Click **Sync Grades**.
 
 ### Setting a credential or skill's sync state
